@@ -54,6 +54,12 @@ class PlainHttpTest {
             exchange.sendResponseHeaders(302, -1);
             exchange.close();
         });
+        server.createContext("/tab", exchange -> {
+            hits.incrementAndGet();
+            exchange.getResponseHeaders().set("location", "http://local\thost.example.com/md");
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+        });
         server.createContext("/ssf", exchange -> {
             hits.incrementAndGet();
             exchange.sendResponseHeaders(404, -1);
@@ -111,6 +117,40 @@ class PlainHttpTest {
     @Test
     void refusesARedirectToPlainHttpOffLoopback() {
         refused(() -> ServiceProvider.create(config("http://" + origin + "/away", null)), "metadata", "http://example.com");
+    }
+
+    @Test
+    void refusesWhitespaceOrControlCharacters() throws Exception {
+        try (ServerSocket listener = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))) {
+            String base = "127.0.0.1:" + listener.getLocalPort();
+            for (String url : new String[] {
+                "http://" + base + "/m\td", "http://" + base + "/m d", "https://" + base + "/m\u0000d",
+                "http://" + base + "/md\u007f", "http://" + base + "/m\u00a0d",
+            }) {
+                whitespace(() -> ServiceProvider.create(config(url, null)), "metadata");
+            }
+            whitespace(() -> resolve("http://" + base + "/a rs"), "artifact");
+            whitespace(() -> receiver("http://" + base + "/s\tsf").start(), "ssf");
+            // Config and SignalsReceiver already refuse a newline (their URL
+            // pattern's '.' does not match one), so it is tried on the back
+            // channel itself.
+            for (String url : new String[] {"http://local\nhost:" + listener.getLocalPort() + "/md", "https://" + base + "/m\r\nd"}) {
+                whitespace(() -> Backchannel.send(url, "GET", Map.of(), null, Map.of(), "metadata"), "metadata");
+            }
+            listener.setSoTimeout(300);
+            assertThrows(SocketTimeoutException.class, listener::accept, "a refused fetch opened a connection");
+        }
+    }
+
+    @Test
+    void refusesARedirectHoldingWhitespace() {
+        whitespace(() -> ServiceProvider.create(config("http://" + origin + "/tab", null)), "metadata");
+    }
+
+    private static void whitespace(Executable fn, String code) {
+        SamlError err = assertThrows(SamlError.class, fn);
+        assertEquals(code, err.code, err.getMessage());
+        assertEquals("the URL is refused: it holds whitespace or a control character", err.getMessage());
     }
 
     @Test
