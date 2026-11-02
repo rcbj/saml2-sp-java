@@ -33,6 +33,7 @@ public final class Backchannel {
 
     public static Answer send(String url, String method, Map<String, String> headers, String body, Map<String, String> tls, String code) {
         if (!(url.startsWith("https://") || url.startsWith("http://"))) throw new SamlError(code, url + " is not an http(s) URL");
+        refuseWhitespaceOrControl(url, code);
         // Every fetch this library makes comes through here: the identity
         // provider's metadata (its signing keys), the ArtifactResolve (the
         // signed request out, the assertion back) and the Shared Signals
@@ -62,6 +63,7 @@ public final class Backchannel {
                 int status = response.statusCode();
                 var location = response.headers().firstValue("location");
                 if (REDIRECTS.contains(status) && location.isPresent() && hop < MAX_REDIRECTS) {
+                    refuseWhitespaceOrControl(location.get(), code);
                     URI next = target.resolve(location.get());
                     String scheme = String.valueOf(next.getScheme()).toLowerCase();
                     // As HttpClient.Redirect.NORMAL did: never from https down to
@@ -92,6 +94,21 @@ public final class Backchannel {
                 throw new SamlError(code, url + " did not answer within " + TIMEOUT.toSeconds() + " s", err);
             }
             throw new SamlError(code, url + ": " + err.getMessage(), err);
+        }
+    }
+
+    /**
+     * Refuses a URL holding whitespace or a control character. No valid URL
+     * holds one, and parsers differ on what to do with it (the WHATWG rules
+     * drop tabs and newlines and trim spaces), so such a URL could name one
+     * host to a reader and another to the dial. The message never repeats it.
+     */
+    static void refuseWhitespaceOrControl(String raw, String code) {
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (Character.isWhitespace(c) || Character.isSpaceChar(c) || Character.isISOControl(c)) {
+                throw new SamlError(code, "the URL is refused: it holds whitespace or a control character");
+            }
         }
     }
 
