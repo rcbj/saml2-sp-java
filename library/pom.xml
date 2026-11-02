@@ -5,7 +5,7 @@
        The demo is the sibling module ../demo, which is never published. -->
   <groupId>com.iyasec</groupId>
   <artifactId>saml2-sp</artifactId>
-  <version>0.1.0</version>
+  <version>0.1.1</version>
   <name>saml2-sp</name>
   <description>Server-side SAML 2.0 service provider: signed AuthnRequests, HTTP-POST, HTTP-Redirect and HTTP-Artifact responses, encrypted assertions, and a Shared Signals poll receiver.</description>
   <url>https://github.com/rcbj/saml2-sp-java</url>

@@ -3,6 +3,7 @@
 package com.iyasec.saml;
 
 import java.io.ByteArrayInputStream;
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -32,18 +33,58 @@ public final class Backchannel {
 
     public static Answer send(String url, String method, Map<String, String> headers, String body, Map<String, String> tls, String code) {
         if (!(url.startsWith("https://") || url.startsWith("http://"))) throw new SamlError(code, url + " is not an http(s) URL");
+        refuseWhitespaceOrControl(url, code);
+        // Every fetch this library makes comes through here: the identity
+        // provider's metadata (its signing keys), the ArtifactResolve (the
+        // signed request out, the assertion back) and the Shared Signals
+        // transmitter (SETs and the bearer token). None of them may travel in
+        // the clear off this machine, so plain http is refused before any DNS
+        // lookup or connection unless the host is loopback, and so is every
+        // redirect, which is why redirects are followed here, not by the client.
+        URI target;
         try {
-            HttpClient.Builder builder = HttpClient.newBuilder().connectTimeout(TIMEOUT).followRedirects(HttpClient.Redirect.NORMAL);
-            if (url.startsWith("https://")) builder.sslContext(ssl(tls == null ? Map.of() : tls));
-            HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(url)).timeout(TIMEOUT);
-            if (headers != null) headers.forEach(request::header);
-            if (body == null) request.method(method, HttpRequest.BodyPublishers.noBody());
-            else request.method(method, HttpRequest.BodyPublishers.ofString(body));
-            HttpResponse<byte[]> response = builder.build().send(request.build(), HttpResponse.BodyHandlers.ofByteArray());
-            byte[] bytes = response.body() == null ? new byte[0] : response.body();
-            if (bytes.length > MAX_BYTES) throw new SamlError(code, url + " answered more than " + MAX_BYTES + " bytes");
-            String type = response.headers().firstValue("content-type").orElse("");
-            return new Answer(response.statusCode(), type, new String(bytes, StandardCharsets.UTF_8));
+            target = URI.create(url);
+        } catch (IllegalArgumentException err) {
+            Caught.error(err);
+            throw new SamlError(code, url + ": " + err.getMessage(), err);
+        }
+        refusePlainHttpOffLoopback(target, code);
+        try {
+            String currentMethod = method;
+            String currentBody = body;
+            for (int hop = 0; ; hop++) {
+                HttpClient.Builder builder = HttpClient.newBuilder().connectTimeout(TIMEOUT).followRedirects(HttpClient.Redirect.NEVER);
+                if ("https".equalsIgnoreCase(target.getScheme())) builder.sslContext(ssl(tls == null ? Map.of() : tls));
+                HttpRequest.Builder request = HttpRequest.newBuilder(target).timeout(TIMEOUT);
+                if (headers != null) headers.forEach(request::header);
+                if (currentBody == null) request.method(currentMethod, HttpRequest.BodyPublishers.noBody());
+                else request.method(currentMethod, HttpRequest.BodyPublishers.ofString(currentBody));
+                HttpResponse<byte[]> response = builder.build().send(request.build(), HttpResponse.BodyHandlers.ofByteArray());
+                int status = response.statusCode();
+                var location = response.headers().firstValue("location");
+                if (REDIRECTS.contains(status) && location.isPresent() && hop < MAX_REDIRECTS) {
+                    refuseWhitespaceOrControl(location.get(), code);
+                    URI next = target.resolve(location.get());
+                    String scheme = String.valueOf(next.getScheme()).toLowerCase();
+                    // As HttpClient.Redirect.NORMAL did: never from https down to
+                    // http, and never to anything but http(s); the 3xx is the answer.
+                    boolean downgrade = "https".equalsIgnoreCase(target.getScheme()) && "http".equals(scheme);
+                    if (!downgrade && ("http".equals(scheme) || "https".equals(scheme))) {
+                        refusePlainHttpOffLoopback(next, code);
+                        // As the JDK's redirect filter: 303, and 301/302 after a POST, become a GET.
+                        if (status == 303 && !"HEAD".equals(currentMethod) || (status == 301 || status == 302) && "POST".equals(currentMethod)) {
+                            currentMethod = "GET";
+                            currentBody = null;
+                        }
+                        target = next;
+                        continue;
+                    }
+                }
+                byte[] bytes = response.body() == null ? new byte[0] : response.body();
+                if (bytes.length > MAX_BYTES) throw new SamlError(code, url + " answered more than " + MAX_BYTES + " bytes");
+                String type = response.headers().firstValue("content-type").orElse("");
+                return new Answer(status, type, new String(bytes, StandardCharsets.UTF_8));
+            }
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
@@ -54,6 +95,60 @@ public final class Backchannel {
             }
             throw new SamlError(code, url + ": " + err.getMessage(), err);
         }
+    }
+
+    /**
+     * Refuses a URL holding whitespace or a control character. No valid URL
+     * holds one, and parsers differ on what to do with it (the WHATWG rules
+     * drop tabs and newlines and trim spaces), so such a URL could name one
+     * host to a reader and another to the dial. The message never repeats it.
+     */
+    static void refuseWhitespaceOrControl(String raw, String code) {
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (Character.isWhitespace(c) || Character.isSpaceChar(c) || Character.isISOControl(c)) {
+                throw new SamlError(code, "the URL is refused: it holds whitespace or a control character");
+            }
+        }
+    }
+
+    private static final java.util.Set<Integer> REDIRECTS = java.util.Set.of(301, 302, 303, 307, 308);
+    private static final int MAX_REDIRECTS = 5;
+
+    /**
+     * Throws unless a plain http URI names a loopback host: 127.0.0.0/8, ::1
+     * or the name localhost, where the bytes never leave the machine. A URI
+     * with userinfo is never loopback, so "http://localhost:80@host/" cannot
+     * pass as localhost. Nothing here resolves a name. The message names the
+     * scheme and host[:port] only: never userinfo, path, query or a secret.
+     */
+    static void refusePlainHttpOffLoopback(URI uri, String code) {
+        if (!"http".equalsIgnoreCase(uri.getScheme())) return;
+        String host = uri.getHost();
+        if (uri.getRawUserInfo() == null && host != null && isLoopbackHost(host)) return;
+        String shown = host == null ? "(no host)" : host + (uri.getPort() == -1 ? "" : ":" + uri.getPort());
+        throw new SamlError(code, "http://" + shown + " is refused: plain http is allowed only to a loopback host (127.0.0.0/8, ::1, localhost); use https");
+    }
+
+    static boolean isLoopbackHost(String host) {
+        if ("localhost".equalsIgnoreCase(host)) return true;
+        if (host.matches("127\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}")) {
+            for (String part : host.split("\\.")) if (Integer.parseInt(part) > 255) return false;
+            return true;
+        }
+        if (host.startsWith("[") && host.endsWith("]")) {
+            String literal = host.substring(1, host.length() - 1);
+            if (!literal.matches("[0-9A-Fa-f:.]+")) return false;
+            try {
+                // A bracketed IPv6 literal: parsed, never looked up.
+                InetAddress address = InetAddress.getByName(literal);
+                return address instanceof java.net.Inet6Address && address.isLoopbackAddress();
+            } catch (Exception err) {
+                Caught.error(err);
+                return false;
+            }
+        }
+        return false;
     }
 
     private static SSLContext ssl(Map<String, String> tls) throws Exception {

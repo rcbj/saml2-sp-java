@@ -31,7 +31,7 @@ FROM eclipse-temurin:17-jre
 WORKDIR /app
 # The demo's jar under the name the image has always run, and beside it every
 # runtime dependency, the library jar among them (com.iyasec.saml.Cli is there).
-COPY --from=build /src/demo/target/saml2-sp-demo-0.1.0.jar /app/saml2-sp.jar
+COPY --from=build /src/demo/target/saml2-sp-demo-0.1.1.jar /app/saml2-sp.jar
 COPY --from=build /src/demo/target/dependency /app/dependency
 # The demo, and with it idpCa's file: demo/generated/idp-ca.pem, the iya-sts
 # listener CA trust chain scripts/configure_iya_sts.py saved. The image trusts
