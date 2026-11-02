@@ -56,14 +56,17 @@ docker build --target test .
 
 The suite runs in a container. The tests sign, encrypt, and decrypt with the JDK and Apache Santuario exclusive canonicalization. Security Event Token checks use Nimbus JOSE only for the JWS. They include a stub identity provider and a stub transmitter. The stub tests do not start iya-sts. Java 17.
 
-`python3 scripts/live_iya_sts.py` is the live half. It builds this demo image, starts the latest main branch of iya-sts in memory mode with persistence and clustering off when `IYA_STS_URL` is unset, registers the demo with the host's `python3 scripts/configure_iya_sts.py`, signs in, and requires a credential-change event and a session-revoked event on `GET /live-status`. The second event ends the local session. It uses two high ports and never binds 3000 or 8081. The nightly workflow runs the unit suite and this script once every 24 hours. Push CI stays the unit suite.
+The suite includes `TrustChainTest`, which runs the install script's trust-chain code (Python and the openssl CLI, installed in the `test` stage) against an HTTPS stub on a four-certificate chain, and checks the library trusts the stub through the file it wrote, trusts a reissued leaf from the same CA, and refuses a forged leaf followed by the real CA certificates and the right chain under the wrong host name.
+
+`python3 scripts/live_iya_sts.py` is the live half. It starts the latest main branch of iya-sts in memory mode with persistence and clustering off when `IYA_STS_URL` is unset (or from `IYA_STS_IMAGE`), copies the checkout to a scratch build context without `demo/generated`, builds the demo image, runs the install script with host `python3 scripts/configure_iya_sts.py` (its Java CLI runs in that image; it writes the key pair, the metadata and `idpCa`'s chain), builds the image again so it carries that chain, checks the image holds the chain and no key, and runs the demo with only `sp.key`, `sp.crt` and `idp-metadata.xml` mounted. It then signs in, and requires a credential-change event and a session-revoked event on `GET /live-status`. The second event ends the local session. It never binds 3000, 8081 or 18481-18495; its defaults are 18555 (`LIVE_STS_PORT`) and 18655 (`LIVE_DEMO_PORT`). Secrets go to docker as `-e NAME` only, and each sign-in request is logged by a fixed label rather than its URL. The nightly workflow runs the unit suite and this script once every 24 hours. Push CI stays the unit suite.
 
 ## Layout
 
 - `src/main/java/com/iyasec/saml/` the library (`ServiceProvider`, metadata, bindings, signatures, encryption, the replay cache, `ssf/`)
 - `src/test/java/com/iyasec/saml/` JUnit 5, including the stub identity provider
 - `src/main/java/com/iyasec/saml/demo/Demo.java` the demo
-- `scripts/configure_iya_sts.py` registers that demo with iya-sts
+- `scripts/configure_iya_sts.py` registers that demo with iya-sts and writes `idpCa`
+- `scripts/trust_chain.py` fetches and saves the iya-sts listener CA trust chain
 - `scripts/live_iya_sts.py` signs the demo in to iya-sts and checks `GET /live-status`
 - `Dockerfile` and `docker-compose.yml` run the demo (`network_mode: host`, `PORT` defaults to 3000)
 - `.github/workflows/nightly.yml` runs the unit suite and the live script once every 24 hours
@@ -82,4 +85,10 @@ docker compose up --build
 python3 scripts/configure_iya_sts.py
 ```
 
-The container's `PORT` wins over the shell's `PORT` when that script chooses the entityID and assertion consumer URL. The shipped demo leaves `signals` unset, so the receiver stays on when `ssf.transmitter` is set.
+The container's `PORT` wins over the shell's `PORT` when that script chooses the entityID and assertion consumer URL. A password it generates for the test user goes to `demo/generated/<user>.password` (mode 0600), never to the output.
+
+## The iya-sts trust chain (`idpCa`)
+
+`idpCa` (demo default `file:generated/idp-ca.pem`, relative to `demo/`) is the iya-sts TLS listener CA trust chain the library trusts for the metadata fetch, artifact resolution and Shared Signals. `scripts/configure_iya_sts.py`, the install script, writes it on every run: the whole chain iya-sts publishes at `GET /tls/server-certificate` (leaf, TLS Issuing CA, Intermediate, Root), or the chain from the TLS handshake when that is missing (`scripts/trust_chain.py`). It prints the path, the anchor's subject and its SHA-256; compare the anchor with the Root CA on iya-sts's PKI page. The library makes every certificate in the file a PKIX trust anchor, so a reissued listener certificate from the same CA is trusted; a certificate that merely appears in the presented chain proves nothing, and the host name is checked against the leaf's subject alternative names.
+
+The demo image build copies that file in (`COPY demo demo`, after the compile; `.dockerignore` admits only `demo/generated/idp-ca.pem` from `demo/generated`), so a demo image built after the install script trusts that iya-sts with no mount and no fetch. Run the install script before you build the image, and rebuild the image after running it against a different iya-sts. A build with no chain file (a fresh clone, CI) still succeeds. The SP's key, certificate and both metadata documents never enter the image: `docker-compose.yml` mounts `demo/generated` at run time. The shipped demo leaves `signals` unset, so the receiver stays on when `ssf.transmitter` is set.

@@ -5,9 +5,14 @@
 # `docker build --target test` runs the suite in this image.
 # The demo image below does not run it.
 FROM maven:3.9.6-eclipse-temurin-17 AS test
+# TrustChainTest runs the install script's trust-chain code: python3, and the
+# openssl CLI it reads certificate names with.
+RUN apt-get update && apt-get install -y --no-install-recommends python3 openssl && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY pom.xml .
 COPY src src
+COPY scripts scripts
+COPY demo/saml.json demo/saml.json
 RUN mvn -B test
 
 FROM maven:3.9.6-eclipse-temurin-17 AS build
@@ -19,6 +24,15 @@ FROM eclipse-temurin:17-jre
 WORKDIR /app
 COPY --from=build /src/target/saml2-sp-0.1.0.jar /app/saml2-sp.jar
 COPY --from=build /src/target/dependency /app/dependency
+# The demo, and with it idpCa's file: demo/generated/idp-ca.pem, the iya-sts
+# listener CA trust chain scripts/configure_iya_sts.py saved. The image trusts
+# that iya-sts with no bind mount and no fetch. Rebuild after running the
+# install script against a different iya-sts.
+# .dockerignore admits that one file from demo/generated (never the SP's key,
+# certificate or either metadata document). A COPY of the demo DIRECTORY
+# succeeds with or without it, so a fresh clone and CI still build; naming the
+# file, or a glob that matches nothing, fails the build in both builders. It
+# comes after the compile, so a new chain does not rebuild the jar.
 COPY demo demo
 COPY scripts scripts
 ENV PORT=3000
