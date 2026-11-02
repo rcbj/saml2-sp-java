@@ -17,10 +17,10 @@ Request bindings are `redirect` and `post`. Response bindings are `post`, `redir
 ## Tests
 
 ```bash
-mvn -B test
+docker build --target test .
 ```
 
-Signatures and decryption are real (JDK ciphers, Apache Santuario exclusive canonicalization). Nimbus JOSE verifies Shared Signals JWS only. The stub identity provider is in `src/test/java/com/iyasec/saml/StubIdp.java`. No live iya-sts. Java 17.
+The `test` stage runs `mvn -B test` in `maven:3.9.6-eclipse-temurin-17`. GitHub Actions uses that command. Do not run Maven on the host. The demo stage packages with `-DskipTests` in its own Maven image. Signatures and decryption are real (JDK ciphers, Apache Santuario exclusive canonicalization). Nimbus JOSE verifies Shared Signals JWS only. The stub identity provider is in `src/test/java/com/iyasec/saml/StubIdp.java`. No live iya-sts. Java 17.
 
 ## Layout
 
@@ -28,7 +28,7 @@ Signatures and decryption are real (JDK ciphers, Apache Santuario exclusive cano
 
 ## Demo
 
-`mvn exec:java`. `GET /healthz` is `200` with body `ok` and does not load the service provider. Pages: sign-in, `/login` (redirect or POST form), `/saml/acs`, logout of one account or every account, metadata, and per-account Shared Signals events. Loopback entityID and assertion-consumer URLs follow `PORT`. Other hosts stay as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path. The default `http://localhost:3000` is not an explicit public URL. `demo/saml.json` uses `file:` placeholders and omits `signals`. Do not commit `demo/generated/`.
+`docker compose up --build`. `GET /healthz` is `200` with body `ok` and does not load the service provider. Pages: sign-in, `/login` (redirect or POST form), `/saml/acs`, logout of one account or every account, metadata, and per-account Shared Signals events. Loopback entityID and assertion-consumer URLs follow `PORT`. Other hosts stay as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path. The default `http://localhost:3000` is not an explicit public URL. `demo/saml.json` uses `file:` placeholders and omits `signals`. Do not commit `demo/generated/`.
 
 ## Signals
 

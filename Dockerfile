@@ -1,6 +1,15 @@
 # syntax=docker/dockerfile:1
 # SPDX-FileCopyrightText: 2026 Iya CyberSecurity Solutions, LLC
 # SPDX-License-Identifier: MIT
+
+# `docker build --target test` runs the suite in this image.
+# The demo image below does not run it.
+FROM maven:3.9.6-eclipse-temurin-17 AS test
+WORKDIR /src
+COPY pom.xml .
+COPY src src
+RUN mvn -B test
+
 FROM maven:3.9.6-eclipse-temurin-17 AS build
 WORKDIR /src
 COPY pom.xml .

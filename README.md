@@ -17,9 +17,17 @@ SamlLogin who = sp.acs(method, url, body, request.id);
 Methods match the TypeScript names: `fromFile`, `login`, `acs`, `postFormHtml`. Group `com.iyasec`, artifact `saml2-sp`, packages under `com.iyasec.saml`.
 
 ```bash
-mvn -q -DskipTests package
-java -cp target/saml2-sp-0.1.0.jar:target/dependency/* com.iyasec.saml.Cli generate-keys --config demo/saml.json
-java -cp target/saml2-sp-0.1.0.jar:target/dependency/* com.iyasec.saml.Cli metadata --config demo/saml.json
+docker compose build
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD/demo:/app/demo" \
+  saml2-sp-java-demo \
+  java -cp 'saml2-sp.jar:dependency/*' \
+  com.iyasec.saml.Cli generate-keys --config demo/saml.json
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD/demo:/app/demo" \
+  saml2-sp-java-demo \
+  java -cp 'saml2-sp.jar:dependency/*' \
+  com.iyasec.saml.Cli metadata --config demo/saml.json
 ```
 
 `postFormHtml` builds the HTTP-POST form. HTTP-Redirect signatures use RSA-SHA256 (`http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`). Success is `urn:oasis:names:tc:SAML:2.0:status:Success`. `generate-keys` writes a self-signed RSA certificate.
@@ -43,10 +51,10 @@ A catch that recovers does not throw. It is still logged. A poll is retried, the
 ## Tests
 
 ```bash
-mvn -B test
+docker build --target test .
 ```
 
-The tests sign, encrypt, and decrypt with the JDK and Apache Santuario exclusive canonicalization. Security Event Token checks use Nimbus JOSE only for the JWS. They include a stub identity provider and a stub transmitter. They do not need a live iya-sts. Java 17.
+The suite runs in a container. The tests sign, encrypt, and decrypt with the JDK and Apache Santuario exclusive canonicalization. Security Event Token checks use Nimbus JOSE only for the JWS. They include a stub identity provider and a stub transmitter. They do not need a live iya-sts. Java 17.
 
 ## Layout
 
@@ -59,7 +67,7 @@ The tests sign, encrypt, and decrypt with the JDK and Apache Santuario exclusive
 ## Demo
 
 ```bash
-mvn -q exec:java
+docker compose up --build
 ```
 
 `PORT` defaults to 3000. `GET /healthz` returns `200` and the body `ok` even when the identity provider metadata is not on disk yet. The home page offers sign-in. `/login` answers a signed AuthnRequest (redirect, or a POST form). `/saml/acs` is the assertion consumer. `/saml/metadata` is this service provider's metadata. A loopback `entityId` and assertion consumer URL follow `PORT`. Any other host stays as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path; the default `http://localhost:3000` is not treated as an explicit public URL.
