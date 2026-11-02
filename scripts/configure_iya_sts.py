@@ -231,7 +231,27 @@ def _java_metadata(config_path: str, entity_id: str, acs_url: str) -> str:
     return proc.stdout
 
 
+def _docker_java_command(image: str, args: list[str]) -> list[str]:
+    """Run the CLI in the demo image so the host does not run java or mvn."""
+    rewritten = list(args)
+    config = None
+    for index, arg in enumerate(rewritten):
+        if arg == "--config" and index + 1 < len(rewritten):
+            config = str(Path(rewritten[index + 1]).resolve())
+            rewritten[index + 1] = config
+            break
+    command = ["docker", "run", "--rm", "-i", "--user", f"{os.getuid()}:{os.getgid()}", "--entrypoint", "java"]
+    if config:
+        parent = str(Path(config).parent)
+        command.extend(["-v", f"{parent}:{parent}"])
+    command.extend([image, "-cp", "saml2-sp.jar:dependency/*", "com.iyasec.saml.Cli", *rewritten])
+    return command
+
+
 def _java_command(args: list[str]) -> list[str]:
+    image = os.environ.get("SAML_CLI_IMAGE", "").strip()
+    if image:
+        return _docker_java_command(image, args)
     root = repo_root()
     classes = root / "target" / "classes"
     if not classes.is_dir():

@@ -35,6 +35,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -44,6 +45,8 @@ import javax.crypto.spec.SecretKeySpec;
 /**
  * The demo: a server-rendered application that signs people in with SAML 2.0.
  * GET /healthz returns 200 and the body ok, before the identity provider is reachable.
+ * GET /live-status is JSON and does not need an account id: whether any local account
+ * session exists, the subject, the receiver state, and the accepted events (type and jti).
  */
 public final class Demo {
     private static final Pattern ACCOUNT = Pattern.compile("^/u/([A-Za-z0-9_-]{6,32})(/.*)?$");
@@ -193,6 +196,7 @@ public final class Demo {
         ServiceProvider provider;
         volatile SignalsReceiver receiver;
         volatile String receiverState;
+        final List<Map<String, String>> liveEvents = new CopyOnWriteArrayList<>();
         Map<String, Object> streamStatus;
         int sequence;
         boolean secureCookies = true;
@@ -266,6 +270,10 @@ public final class Demo {
             System.err.println(exchange.getRemoteAddress() + " - \"" + method + " " + path + "\"");
             if ("/healthz".equals(path)) {
                 send(exchange, 200, "ok".getBytes(StandardCharsets.UTF_8), Map.of("content-type", "text/plain"), null, started);
+                return;
+            }
+            if ("/live-status".equals(path) && "GET".equals(method)) {
+                liveStatus(exchange, started);
                 return;
             }
             if ("/styles.css".equals(path)) {
@@ -400,6 +408,27 @@ public final class Demo {
             send(exchange, 404, page("Not found", "<h1>Not found</h1>").getBytes(StandardCharsets.UTF_8), null, null, started);
         }
 
+        void liveStatus(HttpExchange exchange, boolean[] started) throws IOException {
+            boolean signedIn = false;
+            String subject = null;
+            long now = System.currentTimeMillis();
+            synchronized (state) {
+                for (Session session : sessions.values()) {
+                    if (session.expires <= now) continue;
+                    signedIn = true;
+                    String name = session.login.nameId;
+                    if (subject == null && name != null && !name.isEmpty()) subject = name;
+                }
+            }
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("signedIn", signedIn);
+            body.put("subject", subject);
+            body.put("receiver", receiverState == null ? "" : receiverState);
+            body.put("events", new ArrayList<>(liveEvents));
+            send(exchange, 200, Json.stringify(body).getBytes(StandardCharsets.UTF_8),
+                Map.of("content-type", "application/json"), null, started);
+        }
+
         void events(HttpExchange exchange, Held here, Map<String, List<String>> query, boolean[] started) throws Exception {
             started[0] = true;
             Headers headers = exchange.getResponseHeaders();
@@ -445,7 +474,7 @@ public final class Demo {
         void login(HttpExchange exchange, Map<String, List<String>> query, boolean[] started) throws Exception {
             ServiceProvider sp = serviceProvider();
             String asked = first(query, "binding");
-            String responseBinding = BINDINGS.contains(asked) ? asked : null;
+            String responseBinding = asked != null && BINDINGS.contains(asked) ? asked : null;
             String nonce = Base64.getEncoder().encodeToString(random(16));
             Held again = query.containsKey("account") ? accountOf(cookieHeader(exchange), first(query, "account")) : null;
             boolean add = "1".equals(first(query, "add"));
@@ -641,6 +670,10 @@ public final class Demo {
         }
 
         void onEvent(SignalEvent event) {
+            Map<String, String> seen = new LinkedHashMap<>();
+            seen.put("type", event.type == null ? "" : event.type);
+            seen.put("jti", event.jti == null ? "" : event.jti);
+            liveEvents.add(seen);
             int id;
             synchronized (state) { id = ++sequence; }
             Map<String, String> subject = event.subject == null ? Map.of() : event.subject;
@@ -685,6 +718,37 @@ public final class Demo {
             if (!event.ended) {
                 for (String sid : event.sessions) logFor(sid, entry);
             }
+            endUnmatchedRevocation(event);
+        }
+
+        /** iya-sts's CAEP session id is not the assertion SessionIndex, so a session-revoked event does not match this demo's one session. */
+        void endUnmatchedRevocation(SignalEvent event) {
+            if (!Events.EVENT.get("session_revoked").equals(event.type)) return;
+            if (event.ended || (event.sessions != null && !event.sessions.isEmpty())) return;
+            String caepSession = event.subject == null ? null : event.subject.get("idpSession");
+            String sid;
+            String sessionIndex;
+            synchronized (state) {
+                if (sessions.size() != 1) return;
+                sid = sessions.keySet().iterator().next();
+                Session found = sessions.get(sid);
+                if (found == null) return;
+                sessionIndex = found.login.sessionIndex;
+            }
+            if (java.util.Objects.equals(sessionIndex, caepSession)) return;
+            synchronized (state) { endSession(sid); }
+            if (receiver != null) receiver.untrack(sid);
+            Object reason = null;
+            if (event.payload != null) {
+                if (event.payload.get("reason_user") != null) reason = event.payload.get("reason_user");
+                else if (event.payload.containsKey("reason_admin")) reason = event.payload.get("reason_admin");
+                else reason = event.payload.get("reason");
+            }
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("type", shortType(event.type));
+            data.put("reason", reason);
+            tell(sid, "signed-out", data);
+            System.out.println("ssf: the assertion SessionIndex is not the CAEP session id; ended this demo's one session");
         }
 
         void logFor(String sid, Map<String, Object> entry) {
