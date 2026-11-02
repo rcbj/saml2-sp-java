@@ -6,7 +6,7 @@
   <parent>
     <groupId>com.iyasec</groupId>
     <artifactId>saml2-sp-build</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.1</version>
   </parent>
   <artifactId>saml2-sp-demo</artifactId>
   <name>saml2-sp demo</name>
