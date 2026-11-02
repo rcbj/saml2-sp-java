@@ -1,2 +1,9 @@
 .git
 target
+**/__pycache__
+# demo/generated holds the SP's private key and certificate, the SP and IdP
+# metadata, and any other file the install script wrote. Only idpCa's file, the
+# iya-sts listener CA trust chain, goes into the demo image (Dockerfile,
+# COPY demo demo).
+demo/generated/*
+!demo/generated/idp-ca.pem

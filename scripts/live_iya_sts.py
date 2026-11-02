@@ -11,10 +11,25 @@ credential-change and a session-revoked event, and requires the demo's
 
 The unit suite stays `docker build --target test`. This file is the live half.
 It uses the host's Python and Docker. The demo runs in a container. Configuring
-the client is `python3 scripts/configure_iya_sts.py` on the host, not in a
-container. That registrar's Java CLI runs in the demo image (SAML_CLI_IMAGE),
-not as java or mvn on the host. It does not import this library. Do not bind
-port 3000, 8081, 18481, 18482, or 18483.
+the client is `python3 scripts/configure_iya_sts.py` on the host, standard
+library only, not in a container. That registrar's Java CLI runs in the demo
+image (SAML_CLI_IMAGE), not as java or mvn on the host. It does not import this
+library. Do not bind port 3000, 8081, or 18481-18495. The defaults are 18555
+(iya-sts) and 18655 (the demo).
+
+The trust chain goes in the way a user's does. The checkout is copied to a
+scratch build context (never demo/generated, .git or target), and the demo
+image is built from it so the CLI inside it can write the key pair and the SP
+metadata there. The install script then runs against that copy and writes
+iya-sts's listener CA trust chain where idpCa names it
+(demo/generated/idp-ca.pem). THEN the demo image is built again, which bakes
+that chain in (only the demo/ layer changes), and THEN the demo runs from it.
+Nothing here fetches the CA for the demo, rewrites idpCa, or mounts a CA into
+the demo container: only the key pair and the IdP metadata are mounted, file by
+file. This script reads the saved chain for its own HTTPS client. Secrets reach
+docker and the install script as -e NAME and through the environment, never on
+a command line, and no log line carries a URL from the sign-in (its query and
+path hold opaque handles): each request is logged by a fixed label.
 
 IYA_STS_URL, when set, uses an iya-sts that is already running and does not
 stop it. This script never removes iya-sts-live-main, iya-sts-live-probe, or a
@@ -47,7 +62,7 @@ STS_REPO = "https://github.com/rcbj/iya-sts.git"
 CAEP = "https://schemas.openid.net/secevent/caep/event-type/"
 CREDENTIAL_CHANGE = CAEP + "credential-change"
 SESSION_REVOKED = CAEP + "session-revoked"
-FORBIDDEN_PORTS = {3000, 8081, 18481, 18482, 18483}
+FORBIDDEN_PORTS = {3000, 8081, *range(18481, 18496)}
 PROTECTED_CONTAINERS = {"iya-sts-live-main", "iya-sts-live-probe"}
 
 PROFILE = {
@@ -116,6 +131,7 @@ class Client:
     def __init__(self, ca_file):
         self.jar = http.cookiejar.CookieJar(policy=LoopbackCookiePolicy())
         self.ssl = ssl.create_default_context(cafile=str(ca_file))
+        self.ssl.minimum_version = ssl.TLSVersion.TLSv1_2
 
     def request(self, method, url, body=None, headers=None, timeout=60):
         parts = urllib.parse.urlsplit(url)
@@ -201,31 +217,6 @@ def docker_rm(name):
     subprocess.run(["docker", "rm", "-f", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def ensure_cryptography():
-    probe = subprocess.run(
-        ["python3", "-c", "import cryptography"],
-        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    if probe.returncode == 0:
-        return
-    print("installing cryptography for scripts/configure_iya_sts.py", flush=True)
-    pip = subprocess.run([sys.executable, "-m", "pip", "install", "cryptography"], check=False)
-    if pip.returncode != 0:
-        pip = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", "cryptography"],
-            check=False,
-        )
-    if pip.returncode != 0 and shutil.which("sudo") and shutil.which("apt-get"):
-        run(["sudo", "apt-get", "update"])
-        run(["sudo", "apt-get", "install", "-y", "python3-cryptography"])
-    probe = subprocess.run(
-        ["python3", "-c", "import cryptography"],
-        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    if probe.returncode != 0:
-        raise RuntimeError("scripts/configure_iya_sts.py needs Python's cryptography package")
-
-
 def wait_port(port, timeout):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -237,19 +228,44 @@ def wait_port(port, timeout):
     raise RuntimeError(f"127.0.0.1:{port} did not accept a connection")
 
 
-def fetch_ca(origin, dest):
+def wait_ready(origin, timeout):
+    """Wait for iya-sts's /healthcheck. Unverified: nothing is trusted from it."""
     parts = urllib.parse.urlsplit(origin)
     context = ssl._create_unverified_context()
-    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=30)
-    try:
-        conn.request("GET", "/tls/server-certificate")
-        response = conn.getresponse()
-        body = response.read()
-    finally:
-        conn.close()
-    if response.status != 200 or b"BEGIN CERTIFICATE" not in body:
-        raise RuntimeError(f"GET /tls/server-certificate answered {response.status}")
-    dest.write_bytes(body)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, context=context, timeout=10)
+            try:
+                conn.request("GET", "/healthcheck")
+                response = conn.getresponse()
+                response.read()
+            finally:
+                conn.close()
+            if response.status == 200:
+                return
+            last = f"answered {response.status}"
+        except OSError as err:
+            last = str(err)
+        time.sleep(2)
+    raise RuntimeError(f"{origin}/healthcheck was not ready: {last}")
+
+
+def copy_context(dest):
+    """Copy the checkout to a build context, without .git, target or demo/generated."""
+
+    def ignore(directory, names):
+        here = Path(directory).resolve()
+        skipped = {".git", "__pycache__"} & set(names)
+        if here == ROOT:
+            skipped |= {"target"} & set(names)
+        if here == ROOT / "demo":
+            skipped |= {"generated"} & set(names)
+        return skipped
+
+    shutil.copytree(ROOT, dest, ignore=ignore)
 
 
 def rewrite_config(source, dest, sts_origin, demo_origin):
@@ -257,7 +273,7 @@ def rewrite_config(source, dest, sts_origin, demo_origin):
 
     configure_iya_sts.py rewrites the entityID and assertion consumer URL it
     registers, and it fetches IdP metadata. It does not write ssf.transmitter.
-    wantAssertionsEncrypted is left as the shipped file has it.
+    wantAssertionsEncrypted is left as the shipped file has it, and so is idpCa.
     """
     raw = json.loads(source.read_text(encoding="utf-8"))
     ssf = raw.get("ssf")
@@ -299,6 +315,24 @@ def autopost_form(payload):
     return None
 
 
+# What a sign-in request is logged as. A label is one of these constants, never
+# text taken from the URL: the URLs carry pending-step handles and come back from
+# requests that carried the password.
+LOG_PATHS = (
+    "/authn-api/pending/",
+    "/authn-api/consent/",
+    "/authn-api/mfa/",
+    "/authn/login",
+    "/authn/mfa-setup",
+    "/authn/post-login",
+    "/oauth2/consent",
+    "/saml2",
+    "/saml/acs",
+    "/login",
+    "/live-status",
+)
+
+
 class Driver:
     def __init__(self, client, sts_origin, demo_origin, username, password):
         self.client = client
@@ -310,9 +344,18 @@ class Driver:
     def sts(self, url):
         return origin_of(url).rstrip("/") == self.sts_origin
 
+    def label(self, url):
+        """A constant naming where a request went, never text from the URL."""
+        where = "iya-sts" if self.sts(url) else "demo" if origin_of(url).rstrip("/") == self.demo_origin else "elsewhere"
+        path = path_of(url)
+        for known in LOG_PATHS:
+            if path.startswith(known):
+                return f"{where} {known}"
+        return f"{where} (another path)"
+
     def get(self, url):
         status, headers, payload = self.client.request("GET", url, headers={"accept": "text/html,application/json"})
-        print(f"GET {status} {url}", flush=True)
+        print(f"GET {status} {self.label(url)}", flush=True)
         return status, headers, payload
 
     def post_json(self, url, body, csrf):
@@ -323,7 +366,7 @@ class Driver:
             "origin": self.sts_origin,
             "x-csrf-token": csrf,
         })
-        print(f"POST {status} {url}", flush=True)
+        print(f"POST {status} {self.label(url)}", flush=True)
         return status, headers, payload
 
     def open_view(self, shell_url, api_url):
@@ -331,7 +374,7 @@ class Driver:
         if status in (301, 302, 303, 307, 308):
             return {"redirect": resolve_url(shell_url, one_header(headers, "location"))}
         view_status, _headers, view_payload = self.client.request("GET", api_url, headers={"accept": "application/json"})
-        print(f"GET {view_status} {api_url}", flush=True)
+        print(f"GET {view_status} {self.label(api_url)}", flush=True)
         parsed = json_body(view_payload) or {}
         if view_status in (301, 302, 303, 307, 308):
             return {"redirect": resolve_url(api_url, one_header(_headers, "location"))}
@@ -381,7 +424,7 @@ class Driver:
                 "content-type": "application/x-www-form-urlencoded",
                 "origin": origin_of(url),
             })
-            print(f"POST {posted} {action}", flush=True)
+            print(f"POST {posted} {self.label(action)}", flush=True)
             if posted in (301, 302, 303, 307, 308):
                 return resolve_url(action, one_header(post_headers, "location"))
             if origin_of(action).rstrip("/") == self.demo_origin:
@@ -540,7 +583,7 @@ def wait_for(driver, predicate, what):
     raise RuntimeError(f"timed out waiting for {what}: {json.dumps(last)[:600]}")
 
 
-def prepare_sts(sts_port, secret):
+def prepare_sts(sts_port):
     given = os.environ.get("IYA_STS_URL", "").rstrip("/")
     if given:
         print(f"using {given}", flush=True)
@@ -568,19 +611,19 @@ def prepare_sts(sts_port, secret):
         "-e", "STS_CLUSTER_MODE=off",
         "-e", "STS_WORKERS_REQUEST_COUNT=0",
         "-e", "STS_WORKERS_SURFACE_COUNT=0",
-        "-e", f"STS_ADMIN_API_CLIENT_SECRET={secret}",
+        "-e", "STS_ADMIN_API_CLIENT_SECRET",
         "-e", "STS_LOG_LEVEL=info",
         image,
     )
     return f"https://127.0.0.1:{sts_port}", name
 
 
-def configure_demo(config, sts_origin, demo_origin, username, password, secret, cli_image):
-    ensure_cryptography()
+def configure_demo(context, config, sts_origin, demo_origin, username, cli_image):
+    """The install script, on the host, in the build context: it writes idpCa's file.
+
+    Its Java CLI (key pair, SP metadata) runs in the demo image as this user.
+    """
     env = os.environ.copy()
-    env["ADMIN_API_CLIENT_SECRET"] = secret
-    env["STS_ADMIN_API_CLIENT_SECRET"] = secret
-    env[PROFILE["password_env"]] = password
     env["PUBLIC_URL"] = demo_origin
     env["SAML_CLI_IMAGE"] = cli_image
     completed = run(
@@ -591,7 +634,7 @@ def configure_demo(config, sts_origin, demo_origin, username, password, secret, 
             "--public-url", demo_origin,
             "--test-user", username,
         ],
-        cwd=str(ROOT),
+        cwd=str(context),
         env=env,
         capture_output=True,
     )
@@ -602,46 +645,62 @@ def configure_demo(config, sts_origin, demo_origin, username, password, secret, 
 
 
 def main():
-    sts_port = int(os.environ.get("LIVE_STS_PORT") or 18488)
-    demo_port = int(os.environ.get("LIVE_DEMO_PORT") or 18122)
+    sts_port = int(os.environ.get("LIVE_STS_PORT") or 18555)
+    demo_port = int(os.environ.get("LIVE_DEMO_PORT") or 18655)
     sts_given = bool(os.environ.get("IYA_STS_URL", "").strip())
     bound = [demo_port] if sts_given else [sts_port, demo_port]
     if any(port in FORBIDDEN_PORTS for port in bound) or len(set(bound)) != len(bound):
-        raise SystemExit("LIVE_STS_PORT and LIVE_DEMO_PORT must not bind 3000, 8081, 18481, 18482, or 18483")
+        raise SystemExit("LIVE_STS_PORT and LIVE_DEMO_PORT must not bind 3000, 8081, or 18481-18495")
     secret = os.environ.get("ADMIN_API_CLIENT_SECRET") or os.environ.get("STS_ADMIN_API_CLIENT_SECRET") or secrets.token_urlsafe(24)
     password = os.environ.get(PROFILE["password_env"]) or secrets.token_urlsafe(18)
     username = PROFILE["test_user"]
-    sts_origin, sts_name = prepare_sts(sts_port, secret)
+    # Secrets reach docker and the install script from this environment, never
+    # on a printed command line.
+    os.environ["ADMIN_API_CLIENT_SECRET"] = secret
+    os.environ["STS_ADMIN_API_CLIENT_SECRET"] = secret
+    os.environ[PROFILE["password_env"]] = password
+    sts_origin, sts_name = prepare_sts(sts_port)
     demo_origin = f"http://127.0.0.1:{demo_port}"
     demo_name = PROFILE["repo"] + "-live-demo"
     image = PROFILE["repo"] + "-live:demo"
     work = Path(tempfile.mkdtemp(prefix=PROFILE["repo"] + "-live-"))
     try:
         wait_port(urllib.parse.urlsplit(sts_origin).port or 443, 120)
-        ca_file = work / "idp-ca.pem"
-        deadline = time.time() + 90
-        last_error = None
-        while time.time() < deadline:
-            try:
-                fetch_ca(sts_origin, ca_file)
-                last_error = None
-                break
-            except Exception as err:
-                last_error = err
-                time.sleep(2)
-        if last_error:
-            raise last_error
-        config = work / "saml.json"
-        rewrite_config(ROOT / PROFILE["config_file"], config, sts_origin, demo_origin)
-        docker("build", "-t", image, str(ROOT))
-        configure_demo(config, sts_origin, demo_origin, username, password, secret, image)
+        wait_ready(sts_origin, 90)
+        context = work / "context"
+        copy_context(context)
+        demo_dir = context / "demo"
+        config = context / PROFILE["config_file"]
+        rewrite_config(config, config, sts_origin, demo_origin)
+        idp_ca = json.loads(config.read_text(encoding="utf-8")).get("idpCa")
+        idp_ca_path = idp_ca[len("file:"):] if idp_ca.startswith("file:") else idp_ca
+        ca_file = demo_dir / idp_ca_path
+        # Built once without a chain (as a fresh clone would be) for the CLI that
+        # writes the key pair and the SP metadata; the install script writes the
+        # chain where idpCa names it; built again, which changes only the demo/
+        # layer.
+        docker("build", "-t", image, str(context))
+        configure_demo(context, config, sts_origin, demo_origin, username, image)
+        if "BEGIN CERTIFICATE" not in (ca_file.read_text(encoding="utf-8") if ca_file.exists() else ""):
+            raise RuntimeError(f"the install script did not write idpCa's file {idp_ca_path}")
+        docker("build", "-t", image, str(context))
+        baked = docker("run", "--rm", "--entrypoint", "cat", image, f"/app/demo/{idp_ca_path}", capture_output=True).stdout
+        if baked != ca_file.read_text(encoding="utf-8"):
+            raise RuntimeError(f"the demo image's /app/demo/{idp_ca_path} is not the chain the install script saved")
+        generated = docker("run", "--rm", "--entrypoint", "ls", image, "-A", "/app/demo/generated", capture_output=True).stdout.split()
+        if generated != [Path(idp_ca_path).name]:
+            raise RuntimeError(f"the demo image's /app/demo/generated holds {generated}, not only the trust chain")
+        chain_count = baked.count("BEGIN CERTIFICATE")
+        print(f"the demo image carries the {chain_count}-certificate chain at /app/demo/{idp_ca_path}, and no key", flush=True)
         docker_rm(demo_name)
+        mounts = []
+        for name in ("sp.key", "sp.crt", "idp-metadata.xml"):
+            mounts += ["-v", f"{demo_dir / 'generated' / name}:/app/demo/generated/{name}:ro"]
         docker(
             "run", "-d", "--name", demo_name, "--network", "host",
-            "-v", f"{work}:/work",
+            *mounts,
             "-e", f"PORT={demo_port}",
             "-e", f"PUBLIC_URL={demo_origin}",
-            "-e", "SAML_CONFIG=/work/saml.json",
             image,
         )
         deadline = time.time() + 90
@@ -693,7 +752,14 @@ def main():
             ),
             "session-revoked to end the local session",
         )
-        print(json.dumps({"ok": True, "subject": signed_in.get("subject"), "events": finished.get("events")}, indent=2))
+        print(json.dumps({
+            "ok": True,
+            "subject": signed_in.get("subject"),
+            "idpCaInImage": chain_count,
+            "keysInImage": False,
+            "trustChain": f"demo/{idp_ca_path}, baked into the demo image",
+            "events": finished.get("events"),
+        }, indent=2))
     finally:
         if sys.exc_info()[0] is not None and demo_name:
             logs = subprocess.run(["docker", "logs", demo_name], check=False, text=True, capture_output=True)
