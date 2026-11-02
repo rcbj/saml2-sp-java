@@ -1,74 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
+  <!-- Builds both modules. library/ is com.iyasec:saml2-sp, the library alone, and
+       inherits nothing from this pom. demo/ is the demo, which depends on the library and
+       is never published. Keep the three versions equal to VERSION. -->
   <groupId>com.iyasec</groupId>
-  <artifactId>saml2-sp</artifactId>
+  <artifactId>saml2-sp-build</artifactId>
   <version>0.1.0</version>
-  <name>saml2-sp</name>
-  <description>Server-side SAML 2.0 service provider: signed AuthnRequests, HTTP-POST, HTTP-Redirect and HTTP-Artifact responses, encrypted assertions, and a Shared Signals poll receiver.</description>
-  <licenses>
-    <license>
-      <name>MIT</name>
-      <url>https://opensource.org/license/mit</url>
-    </license>
-  </licenses>
+  <packaging>pom</packaging>
+  <name>saml2-sp build</name>
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>17</maven.compiler.release>
   </properties>
-  <dependencies>
-    <dependency>
-      <groupId>org.apache.santuario</groupId>
-      <artifactId>xmlsec</artifactId>
-      <version>2.3.4</version>
-    </dependency>
-    <dependency>
-      <groupId>com.nimbusds</groupId>
-      <artifactId>nimbus-jose-jwt</artifactId>
-      <version>9.40</version>
-    </dependency>
-    <dependency>
-      <groupId>org.junit.jupiter</groupId>
-      <artifactId>junit-jupiter</artifactId>
-      <version>5.10.2</version>
-      <scope>test</scope>
-    </dependency>
-  </dependencies>
-  <build>
-    <plugins>
-      <plugin>
-        <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.11.0</version>
-        <configuration>
-          <release>17</release>
-        </configuration>
-      </plugin>
-      <plugin>
-        <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.2.5</version>
-      </plugin>
-      <plugin>
-        <groupId>org.codehaus.mojo</groupId>
-        <artifactId>exec-maven-plugin</artifactId>
-        <version>3.1.0</version>
-        <configuration>
-          <mainClass>com.iyasec.saml.demo.Demo</mainClass>
-        </configuration>
-      </plugin>
-      <plugin>
-        <artifactId>maven-dependency-plugin</artifactId>
-        <version>3.2.0</version>
-        <executions>
-          <execution>
-            <id>copy-dependencies</id>
-            <phase>package</phase>
-            <goals><goal>copy-dependencies</goal></goals>
-            <configuration>
-              <outputDirectory>${project.build.directory}/dependency</outputDirectory>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
-    </plugins>
-  </build>
+  <modules>
+    <module>library</module>
+    <module>demo</module>
+  </modules>
 </project>

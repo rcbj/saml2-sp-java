@@ -62,9 +62,9 @@ The suite includes `TrustChainTest`, which runs the install script's trust-chain
 
 ## Layout
 
-- `src/main/java/com/iyasec/saml/` the library (`ServiceProvider`, metadata, bindings, signatures, encryption, the replay cache, `ssf/`)
-- `src/test/java/com/iyasec/saml/` JUnit 5, including the stub identity provider
-- `src/main/java/com/iyasec/saml/demo/Demo.java` the demo
+- `library/` the library, `com.iyasec:saml2-sp`, nothing else in its jar: `library/src/main/java/com/iyasec/saml/` (`ServiceProvider`, metadata, bindings, signatures, encryption, the replay cache, `ssf/`)
+- `library/src/test/java/com/iyasec/saml/` JUnit 5; `library/src/test-fixtures` the stub identity provider, shared with the demo's tests
+- `demo/` the demo module, never published: `demo/src/main/java/com/iyasec/saml/demo/Demo.java`
 - `scripts/configure_iya_sts.py` registers that demo with iya-sts and writes `idpCa`
 - `scripts/trust_chain.py` fetches and saves the iya-sts listener CA trust chain
 - `scripts/live_iya_sts.py` signs the demo in to iya-sts and checks `GET /live-status`
