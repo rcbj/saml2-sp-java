@@ -8,13 +8,29 @@
   <version>0.1.0</version>
   <name>saml2-sp</name>
   <description>Server-side SAML 2.0 service provider: signed AuthnRequests, HTTP-POST, HTTP-Redirect and HTTP-Artifact responses, encrypted assertions, and a Shared Signals poll receiver.</description>
+  <url>https://github.com/rcbj/saml2-sp-java</url>
   <licenses>
     <license>
       <name>MIT</name>
       <url>https://opensource.org/license/mit</url>
     </license>
   </licenses>
+  <developers>
+    <developer>
+      <id>rcbjBlueMars</id>
+      <name>Robert C. Broeckelmann Jr.</name>
+      <organization>Iya CyberSecurity Solutions, LLC</organization>
+      <organizationUrl>https://github.com/rcbj</organizationUrl>
+    </developer>
+  </developers>
+  <scm>
+    <connection>scm:git:https://github.com/rcbj/saml2-sp-java.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/rcbj/saml2-sp-java.git</developerConnection>
+    <url>https://github.com/rcbj/saml2-sp-java</url>
+  </scm>
   <properties>
+    <!-- true builds the bundle Central would receive, signed, and uploads nothing. -->
+    <central.skipPublishing>false</central.skipPublishing>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>17</maven.compiler.release>
   </properties>
@@ -27,7 +43,7 @@
     <dependency>
       <groupId>com.nimbusds</groupId>
       <artifactId>nimbus-jose-jwt</artifactId>
-      <version>9.40</version>
+      <version>10.0.2</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -68,4 +84,73 @@
       </plugin>
     </plugins>
   </build>
+  <profiles>
+    <!-- mvn -Prelease deploy: what publish.yml runs, and only on this module. The tests,
+         the demo and the image never use this profile and never need the signing key.
+         Central requires the sources and javadoc jars, a signature on every file
+         (the gpg plugin's Bouncy Castle signer reads MAVEN_GPG_KEY and
+         MAVEN_GPG_PASSPHRASE, so no gpg program or agent is needed), and checksums,
+         which the publishing plugin writes. The Central Portal user token is the
+         server "central" in settings.xml. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.11.2</version>
+            <configuration>
+              <!-- Missing comments are not errors; malformed ones still are. -->
+              <doclint>all,-missing</doclint>
+            </configuration>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <configuration>
+              <signer>bc</signer>
+            </configuration>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.12.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+              <skipPublishing>${central.skipPublishing}</skipPublishing>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>
