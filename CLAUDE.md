@@ -28,7 +28,7 @@ The `test` stage runs `mvn -B test` in `maven:3.9.6-eclipse-temurin-17`, with `p
 
 ## Layout
 
-`src/main/java/com/iyasec/saml/` library, `ssf/` receiver, `src/test/java/`, `com.iyasec.saml.demo.Demo`, `scripts/configure_iya_sts.py`, `scripts/live_iya_sts.py`, `Dockerfile`, `docker-compose.yml`, `.github/workflows/nightly.yml`. The image name is `saml2-sp-java-demo`. Compose uses `network_mode: host`, service `saml-demo`, and `ENV PORT=3000` in the image. The health check is `http://127.0.0.1:${PORT}/healthz`. The live script never binds port 3000 or 8081.
+Two Maven modules under an aggregator `pom.xml`, which builds both and is never published; keep its version, the library's and the demo's equal to `VERSION`. `library/` is `com.iyasec:saml2-sp`, the library alone: its `pom.xml` inherits nothing, so it is complete as published, and its jar carries no demo class. `library/src/main/java/com/iyasec/saml/` library, `ssf/` receiver, `library/src/test/java/`; `library/src/test-fixtures` holds `StubIdp`, which both modules' tests compile (build-helper) and no published jar carries. `demo/` is `com.iyasec:saml2-sp-demo`, never published: `com.iyasec.saml.demo.Demo`, and `TrustChainTest` (run from the repository root); its jar and `target/dependency` (the library among them) are what the image runs as `saml2-sp.jar:dependency/*`. Then `scripts/configure_iya_sts.py`, `scripts/live_iya_sts.py`, `Dockerfile`, `docker-compose.yml`, `.github/workflows/nightly.yml`. The image name is `saml2-sp-java-demo`. Compose uses `network_mode: host`, service `saml-demo`, and `ENV PORT=3000` in the image. The health check is `http://127.0.0.1:${PORT}/healthz`. The live script never binds port 3000 or 8081.
 
 ## Demo
 

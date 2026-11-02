@@ -1,5 +1,5 @@
 .git
-target
+**/target
 **/__pycache__
 # demo/generated holds the SP's private key and certificate, the SP and IdP
 # metadata, and any other file the install script wrote. Only idpCa's file, the
