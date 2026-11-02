@@ -37,6 +37,7 @@ public final class Keys {
                 }
                 return out.toString();
             } catch (Exception err) {
+                Caught.error(err);
                 throw new SamlError("config", "the certificate fingerprint could not be computed", err);
             }
         }
@@ -61,6 +62,7 @@ public final class Keys {
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("config", "the key pair could not be created: " + err.getMessage(), err);
         }
     }
@@ -72,6 +74,7 @@ public final class Keys {
             if (pem.contains("BEGIN RSA PRIVATE KEY")) der = pkcs1ToPkcs8(der);
             return KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(der));
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("config", "the private key or certificate cannot be read: " + err.getMessage(), err);
         }
     }
@@ -81,6 +84,7 @@ public final class Keys {
             return (X509Certificate) CertificateFactory.getInstance("X.509")
                 .generateCertificate(new ByteArrayInputStream(pem.getBytes(java.nio.charset.StandardCharsets.US_ASCII)));
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("config", "the private key or certificate cannot be read: " + err.getMessage(), err);
         }
     }
@@ -89,6 +93,7 @@ public final class Keys {
         try {
             return pem("CERTIFICATE", certificate.getEncoded());
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("config", "the certificate could not be written", err);
         }
     }
@@ -167,6 +172,7 @@ public final class Keys {
                 ((RSAPublicKey) certificate.getPublicKey()).getPublicExponent()));
             return pub.getModulus().equals(cert.getModulus());
         } catch (Exception err) {
+            Caught.warn(err);
             return false;
         }
     }

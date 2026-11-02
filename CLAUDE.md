@@ -10,6 +10,10 @@ Java service provider for SAML 2.0 Web Browser SSO, plus a Shared Signals poll r
 
 Request bindings are `redirect` and `post`. Response bindings are `post`, `redirect`, and `artifact`. Artifact resolution is a signed SOAP `ArtifactResolve`. HTTP-Redirect query signatures use RSA-SHA256 (`http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`). Success is `urn:oasis:names:tc:SAML:2.0:status:Success`. `com.iyasec.saml.Cli generate-keys` writes a self-signed RSA certificate.
 
+## Errors
+
+`Caught.error` records a caught exception through `java.lang.System.Logger`, including the stack, and the method then throws the `SamlError` it already threw. The caught exception is the cause. `Caught.warn` is the same record when the method recovers and does not throw: a later signing key, a poll retry, a false verification, sign-out cleanup, or a handler that must still acknowledge the Security Event Token. A `catch (SamlError)` that only throws that error again is not logged a second time.
+
 ## Tests
 
 ```bash

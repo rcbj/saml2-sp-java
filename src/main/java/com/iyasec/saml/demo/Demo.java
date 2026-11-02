@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 package com.iyasec.saml.demo;
 
+import com.iyasec.saml.Caught;
 import com.iyasec.saml.Json;
 import com.iyasec.saml.SamlError;
 import com.iyasec.saml.SamlLogin;
@@ -65,6 +66,7 @@ public final class Demo {
         try {
             options = Options.parse(args);
         } catch (IllegalArgumentException err) {
+            Caught.error(err);
             System.err.println(err.getMessage());
             System.exit(1);
             return;
@@ -231,6 +233,7 @@ public final class Demo {
             try {
                 Thread.currentThread().join();
             } catch (InterruptedException ignored) {
+                Caught.error(ignored);
                 Thread.currentThread().interrupt();
                 if (receiver != null) receiver.stop();
                 server.stop(0);
@@ -242,11 +245,13 @@ public final class Demo {
             try {
                 route(exchange, started);
             } catch (Exception err) {
+                Caught.error(err);
                 System.out.println(err);
                 if (!started[0]) {
                     try {
                         send(exchange, 500, page("Error", "<h1>Something went wrong</h1><p class=\"problem\">" + esc(messageOf(err)) + "</p><p><a href=\"/\">Home</a></p>").getBytes(StandardCharsets.UTF_8), null, null, started);
                     } catch (Exception ignored) {
+                        Caught.error(ignored);
                         exchange.close();
                     }
                 }
@@ -329,6 +334,7 @@ public final class Demo {
                 try {
                     sp = serviceProvider();
                 } catch (Exception err) {
+                    Caught.error(err);
                     dropProvider();
                     problem = "The service provider is not configured yet: " + messageOf(err) + ". Run the setup script (python scripts/configure_iya_sts.py).";
                 }
@@ -350,6 +356,7 @@ public final class Demo {
                 try {
                     sp = serviceProvider();
                 } catch (Exception err) {
+                    Caught.error(err);
                     dropProvider();
                     throw err;
                 }
@@ -421,6 +428,7 @@ public final class Demo {
                 if (status != null) stream.write("event: stream\ndata: " + Json.stringify(status) + "\n\n");
                 while (!stream.waitClosed(20_000)) stream.write(": keep-alive\n\n");
             } catch (Exception err) {
+                Caught.error(err);
                 stream.close();
             } finally {
                 synchronized (state) {
@@ -537,6 +545,7 @@ public final class Demo {
                 int maxAge = (int) Math.max(0, (longest - now) / 1000);
                 redirect(exchange, "/u/" + account + "/", 303, List.of(clear, cookie("aset", setId, "/", maxAge, "Lax")), started);
             } catch (Exception err) {
+                Caught.error(err);
                 String what = err instanceof SamlError saml ? saml.code + ": " + saml.getMessage() : String.valueOf(err.getMessage() == null ? err : err.getMessage());
                 System.out.println("sign-in refused: " + what);
                 send(exchange, 400, page("Sign-in failed", "<h1>Sign-in failed</h1><p class=\"problem\">" + esc(what) + "</p><p><a href=\"/\">Start again</a></p>").getBytes(StandardCharsets.UTF_8),
@@ -557,6 +566,7 @@ public final class Demo {
                     current.verify(token);
                     outcome = "sent";
                 } catch (Exception err) {
+                    Caught.error(err);
                     System.out.println("ssf: verification request refused: " + messageOf(err));
                 }
             }
@@ -620,6 +630,7 @@ public final class Demo {
                     Object id = stream == null ? null : stream.get("stream_id");
                     receiverState = "polling stream " + id + " at " + ssf.get("transmitter");
                 } catch (Exception err) {
+                    Caught.error(err);
                     receiverState = "not running: " + messageOf(err);
                     if (receiver == built) receiver = null;
                     System.out.println("ssf: the receiver did not start: " + messageOf(err));
@@ -698,6 +709,7 @@ public final class Demo {
                 try {
                     stream.write(text);
                 } catch (Exception err) {
+                    Caught.error(err);
                     dead.add(stream);
                 }
                 if ("signed-out".equals(event)) stream.close();
@@ -777,6 +789,7 @@ public final class Demo {
                 String host = uri.getHost();
                 secureCookies = "https".equalsIgnoreCase(uri.getScheme()) || "localhost".equals(host) || "127.0.0.1".equals(host);
             } catch (Exception err) {
+                Caught.error(err);
                 System.out.println("cannot read " + options.config + ": " + messageOf(err));
             }
         }
@@ -787,6 +800,7 @@ public final class Demo {
                 Map<String, Object> object = asMap(parsed);
                 return object == null ? Map.of() : object;
             } catch (IOException err) {
+                Caught.error(err);
                 return Map.of();
             }
         }
@@ -987,6 +1001,7 @@ public final class Demo {
             try {
                 return Json.parse(new String(Base64.getUrlDecoder().decode(body), StandardCharsets.UTF_8));
             } catch (Exception err) {
+                Caught.warn(err);
                 return null;
             }
         }
@@ -997,6 +1012,7 @@ public final class Demo {
                 mac.init(new SecretKeySpec(secret, "HmacSHA256"));
                 return Base64.getUrlEncoder().withoutPadding().encodeToString(mac.doFinal(value.getBytes(StandardCharsets.UTF_8)));
             } catch (Exception err) {
+                Caught.error(err);
                 throw new IllegalStateException(err);
             }
         }
@@ -1032,6 +1048,7 @@ public final class Demo {
             String path = URI.create(sp.config.acsUrl).getRawPath();
             return path == null || path.isEmpty() ? "/" : path;
         } catch (Exception err) {
+            Caught.error(err);
             return "/";
         }
     }

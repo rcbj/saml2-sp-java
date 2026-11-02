@@ -47,6 +47,7 @@ public final class Backchannel {
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
+            Caught.error(err);
             String message = String.valueOf(err.getMessage()).toLowerCase();
             if (message.contains("timed out") || message.contains("timeout")) {
                 throw new SamlError(code, url + " did not answer within " + TIMEOUT.toSeconds() + " s", err);

@@ -124,6 +124,7 @@ public final class Metadata {
                 try {
                     out.add(Keys.loadCertificate(Xml.toPem(Xml.text(first.get(0)))));
                 } catch (Exception err) {
+                    Caught.error(err);
                     throw new SamlError("metadata", "a " + use + " certificate in the identity provider's metadata cannot be read", err);
                 }
             }

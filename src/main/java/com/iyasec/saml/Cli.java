@@ -35,14 +35,17 @@ Usage:
         try {
             run(args);
         } catch (Exit err) {
+            Caught.error(err);
             if (err.status != 0) {
                 System.err.println(err.getMessage());
                 System.exit(1);
             }
         } catch (SamlError err) {
+            Caught.error(err);
             System.err.println(err.getMessage());
             System.exit(1);
         } catch (Exception err) {
+            Caught.error(err);
             System.err.println(err.getMessage());
             System.exit(1);
         }
@@ -151,6 +154,7 @@ Usage:
                     String host = java.net.URI.create(entity).getHost();
                     commonName = host == null || host.isEmpty() ? entity : host;
                 } catch (Exception err) {
+                    Caught.error(err);
                     commonName = entity;
                 }
             }

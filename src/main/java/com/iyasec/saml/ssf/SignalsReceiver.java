@@ -3,6 +3,7 @@
 package com.iyasec.saml.ssf;
 
 import com.iyasec.saml.Backchannel;
+import com.iyasec.saml.Caught;
 import com.iyasec.saml.Json;
 import com.iyasec.saml.SamlError;
 import com.iyasec.saml.SamlLogin;
@@ -144,6 +145,7 @@ public final class SignalsReceiver {
             try {
                 return waitFor.join();
             } catch (CompletionException err) {
+                Caught.error(err);
                 Throwable cause = err.getCause() == null ? err : err.getCause();
                 if (cause instanceof RuntimeException runtime) throw runtime;
                 throw new SamlError("ssf", String.valueOf(cause), cause);
@@ -154,6 +156,7 @@ public final class SignalsReceiver {
             mine.complete(result);
             return result;
         } catch (RuntimeException err) {
+            Caught.error(err);
             mine.completeExceptionally(err);
             throw err;
         } finally {
@@ -177,6 +180,7 @@ public final class SignalsReceiver {
         try {
             if (pollOnce()) delay = 0;
         } catch (Exception err) {
+            Caught.warn(err);
             log.warn("ssf: poll failed: " + err);
             delay = Math.min(pollIntervalMs * 4L, 60_000L);
         }
@@ -199,6 +203,7 @@ public final class SignalsReceiver {
         try {
             reply = call("POST", url, body);
         } catch (RuntimeException err) {
+            Caught.error(err);
             ack.addAll(0, pendingAck);
             errs.putAll(pendingErrs);
             throw err;
@@ -217,6 +222,7 @@ public final class SignalsReceiver {
                     handle(jti, String.valueOf(entry.getValue()));
                     ack.add(jti);
                 } catch (Exception err) {
+                    Caught.warn(err);
                     log.warn("ssf: SET " + jti + " refused: " + err);
                     String kind = err instanceof SamlError saml && "signature".equals(saml.code) ? "invalid_key" : "invalid_request";
                     Map<String, String> problem = new LinkedHashMap<>();
@@ -275,6 +281,7 @@ public final class SignalsReceiver {
                 try {
                     onEnd.end(sessions, event);
                 } catch (Exception err) {
+                    Caught.error(err);
                     log.error("ssf: onEndSessions threw for " + eventType + " (SET " + jti + " is still acknowledged): " + err);
                     event.ended = false;
                 }
@@ -287,6 +294,7 @@ public final class SignalsReceiver {
                 try {
                     handler.on(event);
                 } catch (Exception err) {
+                    Caught.error(err);
                     log.error("ssf: a handler for " + eventType + " threw (SET " + jti + " is still acknowledged): " + err);
                 }
             }
@@ -373,6 +381,7 @@ public final class SignalsReceiver {
             try {
                 parsed = Json.parse(answer.body());
             } catch (Exception err) {
+                Caught.error(err);
                 parsed = answer.body();
             }
         }

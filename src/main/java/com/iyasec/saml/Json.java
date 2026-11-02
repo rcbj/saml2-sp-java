@@ -17,6 +17,7 @@ public final class Json {
             if (trimmed.startsWith("[")) return JSONObjectUtils.parse("{\"v\":" + trimmed + "}").get("v");
             if (trimmed.startsWith("{")) return new LinkedHashMap<>(JSONObjectUtils.parse(trimmed));
         } catch (ParseException err) {
+            Caught.error(err);
             throw new IllegalArgumentException(err);
         }
         throw new IllegalArgumentException("not JSON");

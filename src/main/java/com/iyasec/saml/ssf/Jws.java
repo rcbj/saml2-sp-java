@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 package com.iyasec.saml.ssf;
 
+import com.iyasec.saml.Caught;
 import com.iyasec.saml.Json;
 import com.iyasec.saml.SamlError;
 import com.nimbusds.jose.JWSObject;
@@ -77,6 +78,7 @@ public final class Jws {
             if (EC.contains(alg)) return object.verify(new ECDSAVerifier((ECKey) parsed));
             return object.verify(new Ed25519Verifier((OctetKeyPair) parsed));
         } catch (Exception err) {
+            Caught.warn(err);
             return false;
         }
     }
@@ -91,6 +93,7 @@ public final class Jws {
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("signature", "the SET's header or payload is not JSON", err);
         }
     }
@@ -100,6 +103,7 @@ public final class Jws {
         try {
             return Base64.getUrlDecoder().decode(value);
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("signature", "the SET's " + what + " is not base64url", err);
         }
     }

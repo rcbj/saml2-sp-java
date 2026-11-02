@@ -78,6 +78,7 @@ public final class XmlEncryption {
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
+            Caught.error(err);
             fail("the content could not be decrypted", err);
             return "";
         }
@@ -115,6 +116,7 @@ public final class XmlEncryption {
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
+            Caught.error(err);
             fail("the content key could not be unwrapped with this service provider's key", err);
             return new byte[0];
         }

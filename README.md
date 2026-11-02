@@ -34,6 +34,12 @@ receiver.start();
 
 The receiver lives in `com.iyasec.saml.ssf`. It discovers the transmitter, keeps one poll stream (`urn:ietf:rfc:8936`), and verifies each Security Event Token against the published JWKS. By default a session ends on `session-revoked`, `account-disabled`, `account-purged`, `credential-compromise`, and `sessions-revoked`.
 
+## Errors
+
+A caught exception is written to `java.lang.System.Logger` with its stack. The JDK sends that logger to `java.util.logging` unless the application installs a `System.LoggerFinder`. Where this library already threw `SamlError`, it still throws `SamlError`, and the caught exception is the cause.
+
+A catch that recovers does not throw. It is still logged. A poll is retried, the next signing key is tried, an HTTP error body is read, sign-out still finishes after a revoke fails, and a Shared Signals handler that throws does not stop acknowledgement of that event. Passing a `SamlError` through is not logged again: the foreign exception was logged where it was caught.
+
 ## Tests
 
 ```bash

@@ -100,6 +100,7 @@ public final class XmlSignature {
         try {
             got = Base64.getMimeDecoder().decode(compact(Xml.child(ref, Xml.DS, "DigestValue")));
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("signature", what + "'s signature does not verify against the identity provider's certificate: the digest is not base64", err);
         }
         byte[] want = digest(digestName, reference);
@@ -113,6 +114,7 @@ public final class XmlSignature {
         try {
             sigBytes = Base64.getMimeDecoder().decode(compact(Xml.child(signature, Xml.DS, "SignatureValue")));
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("signature", what + "'s signature does not verify against the identity provider's certificate: the signature value is not base64", err);
         }
         boolean verified = false;
@@ -235,6 +237,7 @@ public final class XmlSignature {
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("signature", "the message could not be canonicalized: " + err.getMessage(), err);
         }
     }
@@ -273,6 +276,7 @@ public final class XmlSignature {
         try {
             return MessageDigest.getInstance(algorithm).digest(data);
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("signature", "the digest could not be computed", err);
         }
     }

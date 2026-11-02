@@ -247,6 +247,7 @@ public final class ResponseValidator {
             while (fraction.length() < 9) fraction = fraction + "0";
             return Instant.parse(parts[0] + "." + fraction + "Z");
         } catch (RuntimeException err) {
+            Caught.error(err);
             invalid(what + " is not a dateTime: " + value);
             return null;
         }

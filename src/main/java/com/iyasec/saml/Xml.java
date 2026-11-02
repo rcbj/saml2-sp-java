@@ -58,6 +58,7 @@ public final class Xml {
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("xml", what + " is not well-formed XML: " + err.getMessage(), err);
         }
     }
@@ -80,6 +81,7 @@ public final class Xml {
             transformer.transform(new DOMSource(node), new StreamResult(writer));
             return writer.toString();
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("xml", "the message could not be written: " + err.getMessage(), err);
         }
     }

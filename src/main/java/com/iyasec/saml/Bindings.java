@@ -43,6 +43,7 @@ public final class Bindings {
         try {
             return decode(text);
         } catch (IllegalArgumentException err) {
+            Caught.error(err);
             throw new SamlError("binding", "the query string is not validly percent-encoded", err);
         }
     }
@@ -98,6 +99,7 @@ public final class Bindings {
                 if (out.size() > MAX_INFLATED) throw new SamlError("binding", "the message inflates past the limit");
             }
         } catch (DataFormatException err) {
+            Caught.error(err);
             throw new SamlError("binding", "the message inflates past the limit", err);
         } finally {
             inflater.end();
@@ -134,6 +136,7 @@ public final class Bindings {
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("binding", param + " is not a DEFLATE-encoded message", err);
         }
         String relay = raw.containsKey("RelayState") ? uriUnescape(raw.get("RelayState")) : null;
@@ -158,6 +161,7 @@ public final class Bindings {
         try {
             sigBytes = Base64.getDecoder().decode(uriUnescape(raw.get("Signature")));
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("signature", "the query string signature does not verify against the identity provider's certificate", err);
         }
         for (X509Certificate cert : certs) {
@@ -204,6 +208,7 @@ public final class Bindings {
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("signature", "the signature could not be produced: " + err.getMessage(), err);
         }
     }
@@ -215,6 +220,7 @@ public final class Bindings {
             signature.update(data);
             return signature.verify(sig);
         } catch (Exception err) {
+            Caught.warn(err);
             return false;
         }
     }

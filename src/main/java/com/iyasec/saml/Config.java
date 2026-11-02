@@ -90,6 +90,7 @@ public final class Config {
         } catch (SamlError err) {
             throw err;
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("config", "the private key or certificate cannot be read: " + err.getMessage(), err);
         }
         if (!(privateKey instanceof RSAPrivateKey)) {
@@ -128,6 +129,7 @@ public final class Config {
         try {
             parsed = Json.parse(Files.readString(Path.of(path), StandardCharsets.UTF_8));
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("config", path + " cannot be read as JSON: " + err.getMessage(), err);
         }
         if (!(parsed instanceof Map<?, ?> object)) throw new SamlError("config", "the configuration must be an object");
@@ -166,6 +168,7 @@ public final class Config {
         try {
             return Files.readString(resolved, StandardCharsets.UTF_8);
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("config", what + " is neither a PEM nor a readable file (" + resolved + ")", err);
         }
     }

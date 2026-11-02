@@ -81,6 +81,7 @@ public final class ServiceProvider {
             try {
                 xml = Files.readString(Path.of(source), StandardCharsets.UTF_8);
             } catch (Exception err) {
+                Caught.error(err);
                 throw new SamlError("metadata", "the identity provider metadata file " + source + " cannot be read", err);
             }
         }

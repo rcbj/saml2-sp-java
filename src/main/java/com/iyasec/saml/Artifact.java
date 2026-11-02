@@ -44,6 +44,7 @@ public final class Artifact {
         try {
             expected = MessageDigest.getInstance("SHA-1").digest(idpEntityId.getBytes(StandardCharsets.UTF_8));
         } catch (Exception err) {
+            Caught.error(err);
             throw new SamlError("artifact", "the artifact source id could not be computed", err);
         }
         if (!MessageDigest.isEqual(parsed.sourceId, expected)) {
