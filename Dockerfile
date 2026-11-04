@@ -27,7 +27,7 @@ COPY demo/pom.xml demo/pom.xml
 COPY demo/src demo/src
 # The demo module copies its runtime dependencies, the library among them, to demo/target/dependency.
 RUN mvn -B -DskipTests package
-FROM eclipse-temurin:17-jre
+FROM eclipse-temurin:25-jre
 WORKDIR /app
 # The demo's jar under the name the image has always run, and beside it every
 # runtime dependency, the library jar among them (com.iyasec.saml.Cli is there).
