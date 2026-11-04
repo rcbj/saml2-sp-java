@@ -27,14 +27,14 @@
     <plugins>
       <plugin>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.11.0</version>
+        <version>3.16.0</version>
         <configuration>
           <release>17</release>
         </configuration>
       </plugin>
       <plugin>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.2.5</version>
+        <version>3.6.1</version>
         <configuration>
           <!-- TrustChainTest runs scripts/ and reads demo/saml.json from the repository root. -->
           <workingDirectory>${project.basedir}/..</workingDirectory>
@@ -45,7 +45,7 @@
              compiled into the test classpaths only, never into a published jar. -->
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>build-helper-maven-plugin</artifactId>
-        <version>3.6.0</version>
+        <version>3.6.2</version>
         <executions>
           <execution>
             <id>test-fixtures</id>
@@ -60,14 +60,14 @@
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
-        <version>3.1.0</version>
+        <version>3.6.4</version>
         <configuration>
           <mainClass>com.iyasec.saml.demo.Demo</mainClass>
         </configuration>
       </plugin>
       <plugin>
         <artifactId>maven-dependency-plugin</artifactId>
-        <version>3.6.1</version>
+        <version>3.11.0</version>
         <executions>
           <execution>
             <id>copy-dependencies</id>
