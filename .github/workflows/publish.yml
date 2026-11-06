@@ -11,25 +11,31 @@ on:
 permissions:
   contents: read
 
+# One release at a time: each reads the version the one before it took.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   publish:
-    # The test workflow has already succeeded for this commit on main.
-    # Publish only when that commit is a pull request merged into main.
-    # A direct push stays unpublished. The checkout is the commit the tests
-    # ran. A version already on Maven Central is left there: a release there
-    # is permanent, and the next one is a new version.
+    # The test workflow has already succeeded for this commit on main. Release
+    # only when that commit is a pull request merged into main; a direct push
+    # stays unreleased. .github/scripts/release_decision.py picks the version:
+    # VERSION when it is ahead of what is published, one patch higher when the
+    # shipped files changed since the last release's tag, and otherwise no
+    # release at all, so a change to tests, the demo, or the docs ships nothing.
+    # The version is written into this workspace only and is never committed.
     #
-    # Only library/ is deployed (com.iyasec:saml2-sp); the demo never is.
-    # Maven Central has no trusted publishing, so this job uses four
-    # repository secrets: the Central Portal user token and the release
-    # signing key.
+    # Only library/ is deployed (com.iyasec:saml2-sp); the demo never is. Maven
+    # Central has no trusted publishing, so this job uses four repository
+    # secrets: the Central Portal user token and the release signing key.
     if: >
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       pull-requests: read
     steps:
       - name: Require a pull request merged into main
@@ -50,49 +56,33 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # Every tag: the last release's tag is what the decision compares with.
       - uses: actions/checkout@v4
         if: steps.gate.outputs.publish == 'true'
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Skip a version already on Maven Central
-        id: version
+      - name: Decide whether this commit is a release
+        id: decide
         if: steps.gate.outputs.publish == 'true'
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          set -eu
-          python3 - <<'PY'
-          import os, urllib.error, urllib.request
-          import xml.etree.ElementTree as ET
-          ns = {"m": "http://maven.apache.org/POM/4.0.0"}
-          root = ET.parse("library/pom.xml").getroot()
-          group = root.find("m:groupId", ns).text
-          artifact = root.find("m:artifactId", ns).text
-          version = root.find("m:version", ns).text
-          url = "https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom" % (
-              group.replace(".", "/"), artifact, version, artifact, version)
-          try:
-              urllib.request.urlopen(url)
-              exists = True
-          except urllib.error.HTTPError as e:
-              if e.code != 404:
-                  raise SystemExit("Maven Central returned %d for %s" % (e.code, url))
-              exists = False
-          if exists:
-              print("%s:%s:%s is already on Maven Central." % (group, artifact, version))
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write("deploy=%s\n" % ("false" if exists else "true"))
-          PY
+          python3 .github/scripts/release_decision.py decide maven com.iyasec:saml2-sp "$SHA" library ':(exclude)library/src/test'
 
       - name: Deploy the library
-        if: steps.version.outputs.deploy == 'true'
+        if: steps.decide.outputs.release == 'true'
         env:
+          VERSION: ${{ steps.decide.outputs.version }}
           CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
           CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
           MAVEN_GPG_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           set -eu
+          python3 .github/scripts/release_decision.py stamp maven "$VERSION"
           mkdir -p "$RUNNER_TEMP/m2"
           # The token stays in the environment; settings.xml only names it.
           cat > "$RUNNER_TEMP/m2/settings.xml" <<'XML'
@@ -116,3 +106,14 @@ jobs:
             -e MAVEN_GPG_PASSPHRASE \
             maven:3.9.9-eclipse-temurin-17 \
             mvn -B -ntp -Prelease -f library/pom.xml deploy
+
+      # Publishing and this step are one release: the tag it creates is the
+      # baseline the next decision compares with.
+      - name: Create the tag and the GitHub Release
+        if: steps.decide.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$SHA" --title "$TAG" --generate-notes
