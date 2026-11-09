@@ -45,7 +45,7 @@
              compiled into the test classpaths only, never into a published jar. -->
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>build-helper-maven-plugin</artifactId>
-        <version>3.6.2</version>
+        <version>3.7.0</version>
         <executions>
           <execution>
             <id>test-fixtures</id>
