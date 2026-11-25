@@ -48,6 +48,20 @@ public final class MemorySessionIndex {
         synchronized (lock) { sessions.remove(localId); }
     }
 
+    /** Removes {@code localId} and returns it, even when it has already expired. */
+    public Tracked take(String localId) {
+        synchronized (lock) { return sessions.remove(localId); }
+    }
+
+    /** Whether {@code localId} is tracked and has not expired. Does not remove it. */
+    public boolean contains(String localId) {
+        if (localId == null) return false;
+        synchronized (lock) {
+            Tracked found = sessions.get(localId);
+            return found != null && (found.expiresAt == null || found.expiresAt.toEpochMilli() > Instant.now().toEpochMilli());
+        }
+    }
+
     public List<String> byPerson(String person) {
         synchronized (lock) { return find(session -> person.equals(session.person)); }
     }

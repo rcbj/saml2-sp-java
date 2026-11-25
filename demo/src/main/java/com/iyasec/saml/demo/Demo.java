@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: MIT
 package com.iyasec.saml.demo;
 
+import com.iyasec.pep.Access;
+import com.iyasec.pep.Decision;
 import com.iyasec.saml.Caught;
 import com.iyasec.saml.Json;
 import com.iyasec.saml.SamlError;
 import com.iyasec.saml.SamlLogin;
 import com.iyasec.saml.ServiceProvider;
+import com.iyasec.saml.pep.SamlPep;
 import com.iyasec.saml.ssf.Events;
+import com.iyasec.saml.ssf.MemorySessionIndex;
 import com.iyasec.saml.ssf.SignalEvent;
 import com.iyasec.saml.ssf.SignalsReceiver;
 import com.sun.net.httpserver.Headers;
@@ -194,6 +198,7 @@ public final class Demo {
         final Map<String, Set<Stream>> listeners = new LinkedHashMap<>();
         final Map<String, String> verificationsAsked = new LinkedHashMap<>();
         ServiceProvider provider;
+        final MemorySessionIndex tracked = new MemorySessionIndex();
         volatile SignalsReceiver receiver;
         volatile String receiverState;
         final List<Map<String, String>> liveEvents = new CopyOnWriteArrayList<>();
@@ -390,7 +395,7 @@ public final class Demo {
             }
             if (here != null && "/logout".equals(sub) && "POST".equals(method)) {
                 synchronized (state) { endSession(here.sid); }
-                if (receiver != null) receiver.untrack(here.sid);
+                dropTracked(here.sid);
                 tell(here.sid, "signed-out", Map.of());
                 redirect(exchange, "/", 303, null, started);
                 return;
@@ -399,13 +404,97 @@ public final class Demo {
                 List<Held> all = accountsOfSet(cookies(exchange).get("aset"));
                 for (Held item : all) {
                     synchronized (state) { endSession(item.sid); }
-                    if (receiver != null) receiver.untrack(item.sid);
+                    dropTracked(item.sid);
                     tell(item.sid, "signed-out", Map.of());
                 }
                 redirect(exchange, "/", 303, List.of(cookie("aset", "", "/", 0, "Lax")), started);
                 return;
             }
+            if ("/attribute-protected".equals(path) || orderId(path) != null) {
+                protect(exchange, path, method, started);
+                return;
+            }
+            if ("/pep-status".equals(path) && "GET".equals(method)) {
+                pepStatus(exchange, started);
+                return;
+            }
             send(exchange, 404, page("Not found", "<h1>Not found</h1>").getBytes(StandardCharsets.UTF_8), null, null, started);
+        }
+
+        /** The order id of {@code /orders/<id>}, or null when the path is not one order. */
+        String orderId(String path) {
+            if (path == null || !path.startsWith("/orders/")) return null;
+            String id = path.substring("/orders/".length());
+            if (id.isEmpty() || id.contains("/")) return null;
+            return id;
+        }
+
+        /**
+         * A page the embedded PEP protects. No sign-in is 401. A Deny, an
+         * Unavailable decision, or no service provider to ask is 403.
+         */
+        void protect(HttpExchange exchange, String path, String method, boolean[] started) throws Exception {
+            Held held = current(exchange);
+            if (held == null) {
+                send(exchange, 401, page("Sign in", "<h1>Sign in first</h1><p><a href=\"/login\">Sign in</a></p>").getBytes(StandardCharsets.UTF_8), null, null, started);
+                return;
+            }
+            ServiceProvider sp;
+            try {
+                sp = serviceProvider();
+            } catch (Exception err) {
+                Caught.error(err);
+                send(exchange, 403, page("Forbidden", "<h1>Not allowed</h1><p class=\"problem\">No decision could be asked for: the service provider is not configured: "
+                    + esc(messageOf(err)) + "</p>").getBytes(StandardCharsets.UTF_8), null, null, started);
+                return;
+            }
+            boolean attribute = "/attribute-protected".equals(path);
+            String action = attribute || "GET".equals(method) ? "read" : "write";
+            String type = attribute ? "attribute-protected" : "order";
+            String id = attribute ? "attr1" : orderId(path);
+            Decision decision = sp.decideSession(tracked, held.sid, held.session.login, Access.of(action, type, id));
+            String note = "<p><small>The demo application's policy permits <code>read</code> on <code>attribute-protected</code> when your directory attribute <code>attr1</code> is <code>abc123</code>. The PEP asked iya-sts's PIP for it: it is not in your SAML assertion.</small></p>";
+            String html;
+            if (decision.isPermit()) {
+                html = attribute
+                    ? page("Attribute-protected", "<h1>Allowed</h1><p class=\"notice\">The PEP permitted it: your <code>attr1</code> is <code>abc123</code>.</p>" + note)
+                    : page("Order", "<h1>Order " + esc(id) + "</h1><p>The PEP permitted <code>" + esc(action) + "</code>.</p>");
+            } else if (decision.kind() == Decision.Kind.DENY) {
+                html = page("Forbidden", "<h1>Not allowed</h1><p class=\"problem\">The PEP denied it: " + esc(decision.why()) + "</p>" + (attribute ? note : ""));
+            } else {
+                html = page("Forbidden", "<h1>No decision</h1><p class=\"problem\">The PEP could not decide: " + esc(decision.why()) + "</p>" + (attribute ? note : ""));
+            }
+            send(exchange, decision.httpStatus(), html.getBytes(StandardCharsets.UTF_8), null, null, started);
+        }
+
+        void pepStatus(HttpExchange exchange, boolean[] started) throws Exception {
+            if (current(exchange) == null) {
+                send(exchange, 401, Json.stringify(Map.of("signedIn", false)).getBytes(StandardCharsets.UTF_8),
+                    Map.of("content-type", "application/json", "cache-control", "no-store"), null, started);
+                return;
+            }
+            Object pep = null;
+            try {
+                ServiceProvider sp = serviceProvider();
+                if (sp.pep() != null) pep = SamlPep.statusMap(sp.pep());
+            } catch (Exception err) {
+                Caught.warn(err);
+                pep = Map.of("error", "the service provider is not configured");
+            }
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("pep", pep);
+            send(exchange, 200, Json.stringify(body).getBytes(StandardCharsets.UTF_8),
+                Map.of("content-type", "application/json", "cache-control", "no-store"), null, started);
+        }
+
+        Held current(HttpExchange exchange) {
+            List<Held> accounts = accountsOfSet(cookies(exchange).get("aset"));
+            return accounts.isEmpty() ? null : accounts.get(0);
+        }
+
+        void dropTracked(String sid) {
+            if (receiver != null) receiver.untrack(sid);
+            else tracked.remove(sid);
         }
 
         void liveStatus(HttpExchange exchange, boolean[] started) throws IOException {
@@ -416,7 +505,8 @@ public final class Demo {
                 for (Session session : sessions.values()) {
                     if (session.expires <= now) continue;
                     signedIn = true;
-                    String name = session.login.nameId;
+                    String name = session.login.username();
+                    if (name == null || name.isEmpty()) name = session.login.nameId;
                     if (subject == null && name != null && !name.isEmpty()) subject = name;
                 }
             }
@@ -425,6 +515,15 @@ public final class Demo {
             body.put("subject", subject);
             body.put("receiver", receiverState == null ? "" : receiverState);
             body.put("events", new ArrayList<>(liveEvents));
+            if (file.get("pep") instanceof Map<?, ?>) {
+                try {
+                    ServiceProvider sp = serviceProvider();
+                    body.put("pep", sp.pep() == null ? null : SamlPep.statusMap(sp.pep()));
+                } catch (Exception err) {
+                    Caught.warn(err);
+                    body.put("pep", Map.of("error", "the service provider is not configured"));
+                }
+            }
             send(exchange, 200, Json.stringify(body).getBytes(StandardCharsets.UTF_8),
                 Map.of("content-type", "application/json"), null, started);
         }
@@ -550,7 +649,7 @@ public final class Demo {
                 String account = existing != null ? existing.session.account : b64(random(9));
                 if (existing != null) {
                     synchronized (state) { endSession(existing.sid); }
-                    if (receiver != null) receiver.untrack(existing.sid);
+                    dropTracked(existing.sid);
                     tell(existing.sid, "replaced", Map.of());
                 }
                 String setId = b64(random(32));
@@ -566,6 +665,7 @@ public final class Demo {
                     sessions.put(sid, new Session(login, account, until, setId));
                 }
                 if (receiver != null) receiver.track(sid, login, Instant.ofEpochMilli(until));
+                else tracked.add(MemorySessionIndex.trackedFrom(sid, login, null, Instant.ofEpochMilli(until)));
                 System.out.println("signed in " + login.nameId + " by " + login.binding + " (assertion " + login.assertionId + "); " + order.size() + " account(s) in this browser");
                 long longest = until;
                 synchronized (state) {
@@ -630,8 +730,13 @@ public final class Demo {
             if (ssf == null || receiver != null) return;
             Map<String, String> tls = new LinkedHashMap<>();
             if (sp.config.idpCa != null) tls.put("ca", sp.config.idpCa);
-            tls.put("cert", sp.config.certificatePem);
-            tls.put("key", sp.config.privateKeyPem);
+            if (sp.config.ssfClientKey != null) {
+                tls.put("cert", sp.config.ssfClientCertificate);
+                tls.put("key", sp.config.ssfClientKey);
+            } else {
+                tls.put("cert", sp.config.certificatePem);
+                tls.put("key", sp.config.privateKeyPem);
+            }
             int interval = 5000;
             if (ssf.get("pollIntervalMs") instanceof Number number && number.intValue() != 0) interval = number.intValue();
             SignalsReceiver built = new SignalsReceiver(String.valueOf(ssf.get("transmitter")), (ids, event) -> {
@@ -649,7 +754,9 @@ public final class Demo {
                     tell(sid, "signed-out", data);
                 }
                 System.out.println("ssf: " + shortType(event.type) + " ended " + ids.size() + " local session(s)");
-            }).tls(tls).description("saml2-sp demo (" + sp.config.entityId + ")").pollIntervalMs(interval);
+            }).tls(tls).sessionIndex(tracked).addSubjects(SignalsReceiver.addSubjectsSetting(ssf))
+                .description("saml2-sp demo (" + sp.config.entityId + ")").pollIntervalMs(interval);
+            if (sp.pep() != null) built.pep(sp.pep());
             built.on("*", this::onEvent);
             receiver = built;
             Thread thread = new Thread(() -> {
@@ -737,7 +844,7 @@ public final class Demo {
             }
             if (java.util.Objects.equals(sessionIndex, caepSession)) return;
             synchronized (state) { endSession(sid); }
-            if (receiver != null) receiver.untrack(sid);
+            dropTracked(sid);
             Object reason = null;
             if (event.payload != null) {
                 if (event.payload.get("reason_user") != null) reason = event.payload.get("reason_user");
@@ -800,21 +907,20 @@ public final class Demo {
 
         List<Held> accountsOfSet(String setId) {
             List<Held> out = new ArrayList<>();
-            List<String> expired = new ArrayList<>();
             long now = System.currentTimeMillis();
             synchronized (state) {
                 for (String sid : new ArrayList<>(accountSets.getOrDefault(setId, List.of()))) {
                     Session found = sessions.get(sid);
                     if (found == null) continue;
                     if (found.expires <= now) {
+                        // Expiry drops the cookie session only. Remove Subject is for
+                        // sign-out and an ending event, not a session that merely lapses.
                         endSession(sid);
-                        expired.add(sid);
                         continue;
                     }
                     out.add(new Held(sid, found));
                 }
             }
-            for (String sid : expired) if (receiver != null) receiver.untrack(sid);
             return out;
         }
 
@@ -900,7 +1006,9 @@ public final class Demo {
                 int last = session.signals.isEmpty() ? 0 : ((Number) session.signals.get(0).get("id")).intValue();
                 String panel = "events".equals(tab) ? eventsPanel(base, session, notice) : identity;
                 String goneRow = gone == null ? "" : "<p class=\"notice\">" + esc(gone) + "</p>";
-                return page("Signed in", "<h1>Signed in as " + esc(login.nameId) + "</h1>" + accountBar(accounts, session) + goneRow
+                return page("Signed in", "<h1>Signed in as " + esc(login.nameId) + "</h1>"
+                    + "<p><a href=\"/attribute-protected\">Attribute-protected</a> · <a href=\"/orders/42\">Order 42</a></p>"
+                    + accountBar(accounts, session) + goneRow
                     + tabs(base, tab, count) + "<p id=\"signal-banner\" class=\"problem\" hidden></p><p id=\"signal-toast\" class=\"notice\" hidden></p>"
                     + "<div role=\"tabpanel\" id=\"panel\" data-base=\"" + base + "\" data-tab=\"" + tab + "\" data-last-id=\"" + last + "\">" + panel
                     + "</div><form method=\"post\" action=\"" + base + "/logout\" class=\"inline\"><button type=\"submit\">Sign out of this account</button></form><script src=\"/app.js\"></script>");

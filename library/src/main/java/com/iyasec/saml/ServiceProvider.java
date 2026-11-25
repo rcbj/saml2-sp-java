@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: MIT
 package com.iyasec.saml;
 
+import com.iyasec.pep.Access;
+import com.iyasec.pep.Decision;
+import com.iyasec.pep.Pep;
+import com.iyasec.pep.PepException;
+import com.iyasec.saml.pep.SamlPep;
+import com.iyasec.saml.ssf.MemorySessionIndex;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -31,6 +37,7 @@ public final class ServiceProvider {
     public final Config.Resolved config;
     private Metadata.IdpMetadata idp;
     private final MemoryReplayCache replayCache;
+    private Pep pep;
 
     public ServiceProvider(Config.Resolved config, Metadata.IdpMetadata idp, MemoryReplayCache replayCache) {
         this.config = config;
@@ -41,6 +48,7 @@ public final class ServiceProvider {
     public static ServiceProvider create(Map<String, Object> config, String baseDir, MemoryReplayCache replayCache) {
         ServiceProvider provider = new ServiceProvider(Config.resolveConfig(config, baseDir), null, replayCache);
         provider.refreshMetadata();
+        provider.startPep();
         return provider;
     }
 
@@ -51,6 +59,7 @@ public final class ServiceProvider {
     public static ServiceProvider fromFile(String path, Map<String, Object> overrides, MemoryReplayCache replayCache) {
         ServiceProvider provider = new ServiceProvider(Config.readConfigFile(path, overrides), null, replayCache);
         provider.refreshMetadata();
+        provider.startPep();
         return provider;
     }
 
@@ -60,6 +69,47 @@ public final class ServiceProvider {
 
     public static String postFormHtml(String action, Map<String, String> fields, String nonce) {
         return Bindings.postFormHtml(action, fields, nonce, null);
+    }
+
+    /**
+     * Builds and starts the embedded PEP once the identity provider's entityID
+     * (the {@code pdpUrl} default) is known. An unreachable service is retried
+     * on the PEP's own thread. The constructor does not do this.
+     */
+    private void startPep() {
+        if (config.pep == null) return;
+        String entityId = idp == null || idp.entityId == null ? "" : idp.entityId;
+        pep = SamlPep.build(config.pep, entityId, config.entityId, config.privateKeyPem, config.ssfClientKey);
+        try {
+            pep.start();
+        } catch (PepException err) {
+            throw new SamlError("config", err.detail(), err);
+        }
+    }
+
+    /** The embedded PEP, when the configuration has a {@code pep} section. */
+    public Pep pep() {
+        return pep;
+    }
+
+    /**
+     * Decides one access for a validated sign-in. With no {@code pep} section
+     * the answer is Unavailable: nothing here permits by default.
+     */
+    public Decision decide(SamlLogin login, Access access) {
+        if (pep == null) return SamlPep.unavailable("no pep section is configured");
+        return pep.decide(SamlPep.subjectOf(login), access);
+    }
+
+    /**
+     * {@link #decide} for the local session {@code localId} in {@code sessions}
+     * (the receiver's index). A session that ended is denied without asking.
+     */
+    public Decision decideSession(MemorySessionIndex sessions, String localId, SamlLogin login, Access access) {
+        if (sessions == null || localId == null || !sessions.contains(localId)) {
+            return SamlPep.deny("no signed-in session");
+        }
+        return decide(login, access);
     }
 
     public Metadata.IdpMetadata idp() {

@@ -6,8 +6,9 @@
 # The demo image below does not run it.
 FROM maven:3.9-eclipse-temurin-26 AS test
 # TrustChainTest runs the install script's trust-chain code: python3, and the
-# openssl CLI it reads certificate names with.
-RUN apt-get update && apt-get install -y --no-install-recommends python3 openssl && rm -rf /var/lib/apt/lists/*
+# openssl CLI it reads certificate names with. git fetches iya-pep at the
+# pinned commit, which is not on Maven Central yet; one attempt, not retried.
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates python3 openssl && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 # Both modules: library/ (the published library) and demo/ (the demo, and
 # TrustChainTest, which runs scripts/ against demo/saml.json).
@@ -17,16 +18,28 @@ COPY demo/pom.xml demo/pom.xml
 COPY demo/src demo/src
 COPY scripts scripts
 COPY demo/saml.json demo/saml.json
-RUN mvn -B test
+RUN git init /opt/iya-pep \
+ && git -C /opt/iya-pep remote add origin https://github.com/rcbj/iya-pep-java.git \
+ && git -C /opt/iya-pep fetch --depth 1 origin d2bbf5ee73a93ec3b2aeb01219fc093fbb41c645 \
+ && git -C /opt/iya-pep checkout --detach FETCH_HEAD \
+ && mvn -B -f /opt/iya-pep/pom.xml -DskipTests install \
+ && mvn -B test
 
 FROM maven:3.9-eclipse-temurin-26 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY pom.xml .
 COPY library library
 COPY demo/pom.xml demo/pom.xml
 COPY demo/src demo/src
 # The demo module copies its runtime dependencies, the library among them, to demo/target/dependency.
-RUN mvn -B -DskipTests package
+# iya-pep is installed from the same pinned commit as the test stage.
+RUN git init /opt/iya-pep \
+ && git -C /opt/iya-pep remote add origin https://github.com/rcbj/iya-pep-java.git \
+ && git -C /opt/iya-pep fetch --depth 1 origin d2bbf5ee73a93ec3b2aeb01219fc093fbb41c645 \
+ && git -C /opt/iya-pep checkout --detach FETCH_HEAD \
+ && mvn -B -f /opt/iya-pep/pom.xml -DskipTests install \
+ && mvn -B -DskipTests package
 FROM eclipse-temurin:25-jre
 WORKDIR /app
 # The demo's jar under the name the image has always run, and beside it every

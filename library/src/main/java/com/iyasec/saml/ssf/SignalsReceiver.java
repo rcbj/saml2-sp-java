@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: MIT
 package com.iyasec.saml.ssf;
 
+import com.iyasec.pep.EventStream;
+import com.iyasec.pep.Pep;
 import com.iyasec.saml.Backchannel;
 import com.iyasec.saml.Caught;
 import com.iyasec.saml.Json;
 import com.iyasec.saml.SamlError;
 import com.iyasec.saml.SamlLogin;
+import com.iyasec.saml.pep.SamlPep;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -72,6 +75,12 @@ public final class SignalsReceiver {
     private final Map<String, List<Handler>> handlers = new LinkedHashMap<>();
     private CompletableFuture<Boolean> inflight;
     private final Object gate = new Object();
+    private Pep pep;
+    private boolean addSubjects = true;
+    private volatile String subjectError;
+    private volatile EventStream pepStream;
+    private final List<SubjectCall> subjectCalls = new ArrayList<>();
+    private static final int MAX_SUBJECT_CALLS = 1000;
 
     public SignalsReceiver(String transmitter, EndSessions onEndSessions) {
         if (onEndSessions == null) throw new SamlError("config", "onEndSessions is required");
@@ -92,16 +101,42 @@ public final class SignalsReceiver {
     public SignalsReceiver pollIntervalMs(int pollIntervalMs) { this.pollIntervalMs = pollIntervalMs; return this; }
     public SignalsReceiver maxEvents(int maxEvents) { this.maxEvents = maxEvents; return this; }
     public SignalsReceiver log(Log log) { this.log = log; return this; }
+    /** The embedded PEP. Policy events are wired when {@link #start()} runs, and only when it wants them. */
+    public SignalsReceiver pep(Pep pep) { this.pep = pep; return this; }
+    /** Whether sign-in and sign-out send Add Subject and Remove Subject. On unless set false. */
+    public SignalsReceiver addSubjects(boolean addSubjects) { this.addSubjects = addSubjects; return this; }
 
     public Map<String, Object> stream() { return stream; }
+
+    /** The index of tracked local sessions ({@code ServiceProvider.decideSession}). */
+    public MemorySessionIndex sessionIndex() { return index; }
+
+    /** The event types this receiver asks its stream for. */
+    public List<String> eventsRequested() { return List.copyOf(eventsRequested); }
+
+    /** The last Add/Remove Subject refusal or failure. These are never fatal and never retried. */
+    public String subjectError() { return subjectError; }
+
+    /**
+     * What an {@code ssf} block's {@code addSubjects} says: true when it is
+     * absent, an error when it is not a boolean.
+     */
+    public static boolean addSubjectsSetting(Object ssf) {
+        if (!(ssf instanceof Map<?, ?> block) || !block.containsKey("addSubjects") || block.get("addSubjects") == null) return true;
+        if (!(block.get("addSubjects") instanceof Boolean on)) throw new SamlError("config", "ssf.addSubjects must be true or false");
+        return on;
+    }
 
     public void track(String localId, SamlLogin login) { track(localId, login, null); }
 
     public void track(String localId, SamlLogin login, Instant expiresAt) {
-        index.add(MemorySessionIndex.trackedFrom(localId, login, subjectAttribute, expiresAt));
+        MemorySessionIndex.Tracked record = MemorySessionIndex.trackedFrom(localId, login, subjectAttribute, expiresAt);
+        index.add(record);
+        if (!addSubjects) return;
+        for (String[] identifier : identifiers(record)) queueSubject(new SubjectCall(true, identifier[0], identifier[1]));
     }
 
-    public void untrack(String localId) { index.remove(localId); }
+    public void untrack(String localId) { forget(localId); }
 
     public SignalsReceiver on(String eventType, Handler handler) {
         handlers.computeIfAbsent(eventType, key -> new ArrayList<>()).add(handler);
@@ -110,14 +145,17 @@ public final class SignalsReceiver {
 
     public void start() {
         if (running) return;
+        armPep();
         config = discover();
         jwks(true);
         stream = ensureStream();
+        reportStreamAtStart();
         Object delivery = stream.get("delivery");
         if (!(delivery instanceof Map<?, ?> map) || !(map.get("endpoint_url") instanceof String)) {
             throw new SamlError("ssf", "the stream has no poll endpoint_url");
         }
         running = true;
+        queueApplicationSubject();
         Object delivered = stream.get("events_delivered");
         int count = delivered instanceof List<?> list ? list.size() : 0;
         log.info("ssf: polling stream " + stream.get("stream_id") + " at " + map.get("endpoint_url") + ", delivering " + count + " event type(s)");
@@ -128,6 +166,7 @@ public final class SignalsReceiver {
         running = false;
         if (timer != null) timer.cancel(false);
         timer = null;
+        if (pep != null) setPepStream(EventStream.DOWN);
     }
 
     public boolean pollOnce() {
@@ -153,10 +192,12 @@ public final class SignalsReceiver {
         }
         try {
             boolean result = pollNow();
+            reportPepStream(true);
             mine.complete(result);
             return result;
         } catch (RuntimeException err) {
             Caught.error(err);
+            reportPepStream(false);
             mine.completeExceptionally(err);
             throw err;
         } finally {
@@ -188,6 +229,7 @@ public final class SignalsReceiver {
     }
 
     private boolean pollNow() {
+        sendSubjectCalls();
         Object delivery = stream.get("delivery");
         String url = String.valueOf(((Map<?, ?>) delivery).get("endpoint_url"));
         List<String> pendingAck = new ArrayList<>(ack);
@@ -285,7 +327,7 @@ public final class SignalsReceiver {
                     log.error("ssf: onEndSessions threw for " + eventType + " (SET " + jti + " is still acknowledged): " + err);
                     event.ended = false;
                 }
-                if (event.ended) for (String localId : sessions) index.remove(localId);
+                if (event.ended) for (String localId : sessions) forget(localId);
             }
             List<Handler> both = new ArrayList<>();
             if (handlers.get(eventType) != null) both.addAll(handlers.get(eventType));
@@ -346,7 +388,7 @@ public final class SignalsReceiver {
                 if (item instanceof Map<?, ?> map) {
                     Object delivery = map.get("delivery");
                     if (delivery instanceof Map<?, ?> method && POLL_METHOD.equals(method.get("method")) && map.get("stream_id") != null) {
-                        return cast(map);
+                        return withRequestedEvents(cast(map), endpoint);
                     }
                 }
             }
@@ -363,6 +405,193 @@ public final class SignalsReceiver {
             throw new SamlError("ssf", "creating a stream at " + endpoint + " answered " + created.status + ": " + clip(created.json));
         }
         return stream;
+    }
+
+    /**
+     * A stream found rather than created can predate an event type this
+     * receiver asks for now. PATCH merges the missing types in. A transmitter
+     * that refuses leaves the stream as it was; the receiver still starts.
+     */
+    private Map<String, Object> withRequestedEvents(Map<String, Object> found, String endpoint) {
+        List<String> requested = stringList(found.get("events_requested"));
+        if (requested == null) requested = stringList(found.get("events_delivered"));
+        if (requested == null) return found;
+        List<String> missing = new ArrayList<>();
+        for (String event : eventsRequested) if (!requested.contains(event)) missing.add(event);
+        if (missing.isEmpty()) return found;
+        String streamId = String.valueOf(found.get("stream_id"));
+        List<String> merged = new ArrayList<>(requested);
+        merged.addAll(missing);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("stream_id", streamId);
+        body.put("events_requested", merged);
+        String added = String.join(", ", missing);
+        try {
+            Reply patched = call("PATCH", endpoint, body);
+            if (patched.status == 200 && patched.json instanceof Map<?, ?> map && streamId.equals(String.valueOf(map.get("stream_id")))) {
+                Map<String, Object> updated = cast(map);
+                if (!updated.containsKey("delivery") && found.get("delivery") != null) updated.put("delivery", found.get("delivery"));
+                return updated;
+            }
+            log.error("ssf: adding " + added + " to stream " + streamId + " answered " + patched.status + ": " + clip(patched.json));
+        } catch (RuntimeException err) {
+            Caught.error(err);
+            log.error("ssf: adding " + added + " to stream " + streamId + " failed: " + err);
+        }
+        return found;
+    }
+
+    private void armPep() {
+        if (pep == null) return;
+        String tlsKey = tls.get("key");
+        String thumbprint;
+        try {
+            thumbprint = pep.keyThumbprint();
+        } catch (RuntimeException err) {
+            throw err;
+        } catch (Exception err) {
+            throw new SamlError("config", err.getMessage(), err);
+        }
+        if (tlsKey != null && SamlPep.sameThumbprint(tlsKey, thumbprint)) {
+            throw new SamlError("config", "the receiver's TLS client key (ssf.clientKey, or the SP's privateKey it falls back to) is pep.assertionKey; the PEP needs a key of its own");
+        }
+        if (!SamlPep.wantsEvents(pep)) {
+            pep = null;
+            return;
+        }
+        if (!eventsRequested.contains(Pep.POLICIES_CHANGED_EVENT)) eventsRequested.add(Pep.POLICIES_CHANGED_EVENT);
+        Pep bound = pep;
+        on(Pep.POLICIES_CHANGED_EVENT, event -> {
+            try {
+                bound.onPolicyEvent(SamlPep.toJson(event.payload));
+            } catch (Exception err) {
+                Caught.error(err);
+                log.error("ssf: the PEP refused a policy event (the SET is still acknowledged): " + err);
+            }
+        });
+    }
+
+    private void reportStreamAtStart() {
+        if (pep == null) return;
+        Boolean delivered = listed(stream.get("events_delivered"));
+        Boolean requested = listed(stream.get("events_requested"));
+        boolean carried = delivered != null ? delivered : requested != null ? requested : true;
+        EventStream state = carried ? EventStream.REQUESTED : EventStream.EXCLUDED;
+        pepStream = state;
+        setPepStream(state);
+    }
+
+    /** Whether the event list carries the policy event, or null when it is not a list. */
+    private Boolean listed(Object events) {
+        if (!(events instanceof List<?> list)) return null;
+        for (Object item : list) if (Pep.POLICIES_CHANGED_EVENT.equals(String.valueOf(item))) return true;
+        return false;
+    }
+
+    private void reportPepStream(boolean ok) {
+        if (pep == null) return;
+        if (ok) {
+            if (pepStream != null) setPepStream(pepStream);
+        } else {
+            setPepStream(EventStream.DOWN);
+        }
+    }
+
+    private void setPepStream(EventStream state) {
+        try {
+            pep.setEventStream(state);
+        } catch (Exception err) {
+            Caught.warn(err);
+            log.warn("ssf: the PEP was not told the stream is " + state.asString() + ": " + err);
+        }
+    }
+
+    private void queueApplicationSubject() {
+        if (!addSubjects || pep == null) return;
+        String application = pep.config().application;
+        if (application == null || application.isEmpty()) return;
+        synchronized (subjectCalls) {
+            subjectCalls.add(0, new SubjectCall(true, "opaque", application));
+        }
+    }
+
+    private void forget(String localId) {
+        MemorySessionIndex.Tracked record = index.take(localId);
+        if (record == null || !addSubjects) return;
+        for (String[] identifier : identifiers(record)) {
+            List<String> others = "email".equals(identifier[0]) ? index.byEmail(identifier[1]) : index.byPerson(identifier[1]);
+            if (others.isEmpty()) queueSubject(new SubjectCall(false, identifier[0], identifier[1]));
+        }
+    }
+
+    private void queueSubject(SubjectCall call) {
+        synchronized (subjectCalls) {
+            if (subjectCalls.size() >= MAX_SUBJECT_CALLS) {
+                subjectCalls.remove(0);
+                log.warn("ssf: too many Add/Remove Subject calls waiting for the transmitter; dropped the oldest");
+            }
+            subjectCalls.add(call);
+        }
+    }
+
+    private void sendSubjectCalls() {
+        String addEndpoint = text(config, "add_subject_endpoint");
+        String removeEndpoint = text(config, "remove_subject_endpoint");
+        String issuer = text(config, "issuer");
+        String streamId = stream == null || stream.get("stream_id") == null ? "" : String.valueOf(stream.get("stream_id"));
+        if (streamId.isEmpty()) return;
+        List<SubjectCall> calls;
+        synchronized (subjectCalls) {
+            calls = new ArrayList<>(subjectCalls);
+            subjectCalls.clear();
+        }
+        for (SubjectCall call : calls) {
+            String endpoint = call.add ? addEndpoint : removeEndpoint;
+            String what = call.add ? "adding" : "removing";
+            if (endpoint.isEmpty()) continue;
+            Map<String, Object> subject = new LinkedHashMap<>();
+            subject.put("format", call.format);
+            if ("email".equals(call.format)) subject.put("email", call.value);
+            else if ("opaque".equals(call.format)) subject.put("id", call.value);
+            else {
+                subject.put("iss", issuer);
+                subject.put("sub", call.value);
+            }
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("stream_id", streamId);
+            body.put("subject", subject);
+            if (call.add) body.put("verified", true);
+            boolean unexpected = true;
+            String line;
+            try {
+                Reply reply = call("POST", endpoint, body);
+                if (reply.status == 200 || reply.status == 204) continue;
+                if (reply.status == 403) {
+                    unexpected = false;
+                    line = "ssf: " + what + " an " + call.format + " subject on stream " + streamId + " was refused (403; the transmitter may know no active session for it yet); not retried";
+                } else {
+                    line = "ssf: " + what + " an " + call.format + " subject on stream " + streamId + " answered " + reply.status + ": " + clip(reply.json);
+                }
+            } catch (RuntimeException err) {
+                Caught.error(err);
+                line = "ssf: " + what + " an " + call.format + " subject on stream " + streamId + " failed: " + err;
+            }
+            if (unexpected) log.error(line);
+            else log.warn(line);
+            subjectError = line;
+        }
+    }
+
+    private static String text(Map<String, Object> source, String name) {
+        if (source == null || source.get(name) == null) return "";
+        return String.valueOf(source.get(name));
+    }
+
+    private static List<String[]> identifiers(MemorySessionIndex.Tracked record) {
+        List<String[]> out = new ArrayList<>();
+        if (record.person() != null && !record.person().isEmpty()) out.add(new String[] {"iss_sub", record.person()});
+        if (record.email() != null && !record.email().isEmpty()) out.add(new String[] {"email", record.email()});
+        return out;
     }
 
     private Reply call(String method, String url, Object body) {
@@ -388,6 +617,14 @@ public final class SignalsReceiver {
         return new Reply(answer.status(), parsed);
     }
 
+    /** The value as a list of strings, or null when it is not a list (so a missing key is left alone). */
+    private static List<String> stringList(Object value) {
+        if (!(value instanceof List<?> list)) return null;
+        List<String> out = new ArrayList<>();
+        for (Object item : list) out.add(String.valueOf(item));
+        return out;
+    }
+
     private static List<String> strings(Object value) {
         if (value instanceof List<?> list) {
             List<String> out = new ArrayList<>();
@@ -410,4 +647,6 @@ public final class SignalsReceiver {
     }
 
     private record Reply(int status, Object json) {}
+
+    private record SubjectCall(boolean add, String format, String value) {}
 }
