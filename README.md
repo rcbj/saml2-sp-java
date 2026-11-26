@@ -2,7 +2,7 @@
 
 Server-side SAML 2.0 service provider for Java. It sends a signed `AuthnRequest` on HTTP-Redirect or HTTP-POST, accepts a `Response` on HTTP-POST, HTTP-Redirect, or HTTP-Artifact, verifies XML signatures, decrypts encrypted assertions, and can poll a Shared Signals transmitter for CAEP and RISC events.
 
-License: MIT. `develop` and `main` are one commit. A pull request merged into `main` publishes the library (`library/` only; the demo never) to Maven Central after the test workflow succeeds on that commit. A direct push does not. `publish.yml` runs `mvn -Prelease -f library/pom.xml deploy` in the Maven container: the `release` profile adds the sources and javadoc jars, a GPG signature on every file, and the Central publishing plugin, which uploads, publishes and waits until the release is live. Maven Central has no trusted publishing, so the job uses four repository secrets: `CENTRAL_TOKEN_USERNAME` and `CENTRAL_TOKEN_PASSWORD` (a Central Portal user token) and `GPG_PRIVATE_KEY` and `GPG_PASSPHRASE` (the release signing key, whose public half is on a public key server). A release happens when the library's files changed since the last release's tag: `publish.yml` takes one patch above the highest published version, publishes it, and creates the matching tag and GitHub Release. A change to tests, the demo, or the docs releases nothing. To choose a version or start a new minor, raise `VERSION`; the version is stamped in CI and is not committed, so the manifests can trail what is published. `-Dcentral.skipPublishing=true` builds and signs everything and uploads nothing.
+License: MIT. This line of work stays on `develop` until `com.iyasec:iya-pep:0.1.0` is on Maven Central. A merge to `main` publishes the library, and that publish cannot depend on a git pin. `develop` is ahead of `origin/main`. A pull request merged into `main` publishes the library (`library/` only; the demo never) to Maven Central after the test workflow succeeds on that commit. A direct push does not. `publish.yml` runs `mvn -Prelease -f library/pom.xml deploy` in the Maven container: the `release` profile adds the sources and javadoc jars, a GPG signature on every file, and the Central publishing plugin, which uploads, publishes and waits until the release is live. Maven Central has no trusted publishing, so the job uses four repository secrets: `CENTRAL_TOKEN_USERNAME` and `CENTRAL_TOKEN_PASSWORD` (a Central Portal user token) and `GPG_PRIVATE_KEY` and `GPG_PASSPHRASE` (the release signing key, whose public half is on a public key server). A release happens when the library's files changed since the last release's tag: `publish.yml` takes one patch above the highest published version, publishes it, and creates the matching tag and GitHub Release. A change to tests, the demo, or the docs releases nothing. To choose a version or start a new minor, raise `VERSION`; the version is stamped in CI and is not committed, so the manifests can trail what is published. `-Dcentral.skipPublishing=true` builds and signs everything and uploads nothing.
 
 ## Usage
 
@@ -42,6 +42,74 @@ receiver.start();
 
 The receiver lives in `com.iyasec.saml.ssf`. It discovers the transmitter, keeps one poll stream (`urn:ietf:rfc:8936`), and verifies each Security Event Token against the published JWKS. By default a session ends on `session-revoked`, `account-disabled`, `account-purged`, `credential-compromise`, and `sessions-revoked`.
 
+With `ssf.clientCertificate` and `ssf.clientKey` (both, or neither), the receiver presents that pair. Without them it presents the service provider's key pair. `ssf.addSubjects` defaults to true: each `track` queues Add Subject, and the last local session for a person queues Remove Subject.
+
+## Embedded PEP
+
+Ask iya-sts whether a signed-in person may act on a resource. The PEP is [`com.iyasec:iya-pep`](https://github.com/rcbj/iya-pep-java) 0.1.0 (iya-sts [#1206](https://github.com/rcbj/iya-sts/issues/1206)). **[docs/remote-pep.md](docs/remote-pep.md)** is the guide: setting up iya-sts, `central` or `local`, configuration, obligations, policy-change events and troubleshooting.
+
+```json
+"pep": { "name": "pep-orders", "mode": "local", "assertionKey": "pep-key.pem" }
+```
+
+```java
+Decision decision = sp.decideSession(receiver.sessionIndex(), localId, login, Access.of("read", "order", "42"));
+int status = decision.httpStatus(); // 200 for a Permit, 403 for anything else
+```
+
+The section is off unless present. There is no separate build flag. A missing `mode` is `local`. `pdpUrl` defaults to the identity provider's entityID and `application` to `entityId`. The subject's id is `SamlLogin.username()`, else the NameID. `decideSession` denies an untracked or expired session without asking the engine. `SignalsReceiver.pep` asks the stream for `pep-policies-changed` when the PEP wants events, and tells the PEP whether the stream is up. The demo protects `GET /attribute-protected` and `/orders/<id>` with `httpStatus()`: 401 signed out, 403 on a Deny or any failure.
+
+```bash
+docker compose build
+docker run --rm --network host --user "$(id -u):$(id -g)" \
+  -v "$PWD/demo:/app/demo" -e ADMIN_API_CLIENT_SECRET -e IYA_STS_URL \
+  saml2-sp-java-demo python3 scripts/configure_iya_sts.py --pep local
+docker compose up --build
+```
+
+`--pep` with no mode is `local`. `--pep central` switches the mode and keeps the account, the key (`demo/generated/pep-key.pem`, 0600) and the application's own policy. The realm root is not changed. `GET /orders/42` is allowed when the sign-in carried an AuthnContextClassRef. Any other method on that order is denied. `GET /attribute-protected` is allowed when the directory attribute `attr1` is `abc123`.
+
+## Credentials
+
+Every key, certificate and secret the demo and its install script use, with who makes each one, where it is kept, and what it proves. No value appears here. Paths under `demo/generated/` are relative to the checkout. That directory is never committed, and only `idp-ca.pem` from it goes into the demo image.
+
+### The application's own credentials
+
+| Credential | Type | Made or issued by | Where it lives | Used for | How iya-sts learns of it | Rotation |
+|---|---|---|---|---|---|---|
+| SP key pair | RSA-3072 key (the CLI default), self-signed certificate valid 1095 days, subject `CN=` the entity host or `saml2-sp service provider` | `com.iyasec.saml.Cli generate-keys`, run by the install script inside the demo image | `privateKey` → `demo/generated/sp.key` (0600), `certificate` → `demo/generated/sp.crt` | Signing the AuthnRequest and the `ArtifactResolve`; decrypting the encrypted assertion (AES-256-GCM, the key wrapped with RSA-OAEP) | In the SP metadata the install script registers | Replace the files with `--force` and register the new metadata before the next sign-in. This script has no `--new-sp-keys` |
+| Shared Signals client certificate | EC P-256 key and a certificate from the realm's TLS client Issuing CA, named `urn:sts:application:<entityID>` | iya-sts: `/admin-api/applications/issue-tls-client-certificate` (`keyAlg` `ec-p256`). The key comes back once, encrypted, and the script opens it with `openssl pkey -passin env:` | `ssf.clientKey` → `demo/generated/ssf-client.key` (0600, never printed), `ssf.clientCertificate` → `demo/generated/ssf-client.crt` | Mutual TLS for the receiver's calls to `/ssf/*` | iya-sts issued it and lists it on the application. Nothing is added to the process-wide client-certificate truststore | Kept while the application's page lists it valid. Otherwise the next run issues a new one |
+| Fallback for Shared Signals | The SP key pair | — | — | Without `ssf.clientCertificate` and `ssf.clientKey`, the demo presents the SP key pair | The install script removes an anchor and stored copy an earlier run added | — |
+| Test user's password | Password | `$SAML_DEMO_USER_PASSWORD`, or iya-sts generates one when the user is created | Generated: beside the key pair, `demo/generated/<user>.password` (created 0600). Only the path is printed | Signing in to the demo as `saml-demo-user` | iya-sts holds the user | Set `SAML_DEMO_USER_PASSWORD` and run the script again |
+| Demo session key | Random bytes, or `$SESSION_SECRET` | The demo, at start | In memory | HMAC on the demo's `aset` cookie | iya-sts never sees it | A restart makes a new one, unless `SESSION_SECRET` is set |
+
+### The embedded PEP's credentials
+
+| Credential | Type | Made or issued by | Where it lives | Used for | Rotation |
+|---|---|---|---|---|---|
+| Service account `pep-saml-demo` (`--pep-name`) | A directory account with no password, owned by `admin-write`, in the group `remote-peps` | The install script (`/admin-api/users/create` when unknown; `/admin-api/groups/add-member`) | iya-sts | The PEP's identity. Its key is bound to it, and through it to the application (the entityID) | Delete it in iya-sts and run the script again |
+| PEP key | EC P-256 key | `openssl genpkey` in the install script, only when the file is missing | `pep.assertionKey` → `demo/generated/pep-key.pem` (0600, never printed, kept out of the image) | The PEP's RFC 7523 self-assertion and each DPoP proof | Certified by `/admin-api/xacml/issue-pep-credential` when the key or the account is new. Otherwise `/admin-api/xacml/set-pep-application` binds the kept key. Delete the file and run the script again for a new key |
+
+`ServiceProvider` refuses a PEP key whose JWK thumbprint equals `privateKey` or `ssf.clientKey`. `SignalsReceiver.start` refuses when the TLS client key it presents is that same key.
+
+### Install-time only
+
+| Credential | Type | Where it lives | Used for |
+|---|---|---|---|
+| Management client secret | `ADMIN_API_CLIENT_SECRET` or `STS_ADMIN_API_CLIENT_SECRET` | The environment, never a file this script writes | Minting the token for `/admin-api`. Defining `attr1` uses a separate token with `admin:read admin:security` for that call alone |
+| One-time key password | Random, for the issued SSF client key and not stored | Passed to `openssl` through the environment | Opening the encrypted PKCS#8 once. It is never printed |
+
+### Trust material
+
+| Material | Where it lives | Used for |
+|---|---|---|
+| iya-sts listener CA chain | `idpCa` → `demo/generated/idp-ca.pem` (the one generated file the image copies in) | TLS to iya-sts for metadata, artifact resolution, Shared Signals and the PEP (`tlsCa` defaults to this PEM) |
+| Transmitter JWKS | Fetched, not stored | Verifying Security Event Tokens, including `pep-policies-changed` |
+
+### Development and product iya-sts
+
+The PEP's credential is the same in both: a certified key and a DPoP-bound token. The receiver's realm-issued TLS client certificate is checked the same way. The install script's `--idp` is the realm URL (`https://host/realm/<id>` or the default realm).
+
 ## Errors
 
 A caught exception is written to `java.lang.System.Logger` with its stack. The JDK sends that logger to `java.util.logging` unless the application installs a `System.LoggerFinder`. Where this library already threw `SamlError`, it still throws `SamlError`, and the caught exception is the cause.
@@ -63,7 +131,7 @@ The suite includes `TrustChainTest`, which runs the install script's trust-chain
 ## Layout
 
 - `library/` the library, `com.iyasec:saml2-sp`, nothing else in its jar: `library/src/main/java/com/iyasec/saml/` (`ServiceProvider`, metadata, bindings, signatures, encryption, the replay cache, `ssf/`)
-- `library/src/test/java/com/iyasec/saml/` JUnit 5; `library/src/test-fixtures` the stub identity provider, shared with the demo's tests
+- `library/src/test/java/com/iyasec/saml/` JUnit 5; `library/src/test-fixtures/java/com/iyasec/saml/StubIdp.java` the stub identity provider, shared with the demo's tests
 - `demo/` the demo module, never published: `demo/src/main/java/com/iyasec/saml/demo/Demo.java`
 - `scripts/configure_iya_sts.py` registers that demo with iya-sts and writes `idpCa`
 - `scripts/trust_chain.py` fetches and saves the iya-sts listener CA trust chain
@@ -77,7 +145,7 @@ The suite includes `TrustChainTest`, which runs the install script's trust-chain
 docker compose up --build
 ```
 
-`PORT` defaults to 3000. `GET /healthz` returns `200` and the body `ok` even when the identity provider metadata is not on disk yet. The home page offers sign-in. `/login` answers a signed AuthnRequest (redirect, or a POST form). `/saml/acs` is the assertion consumer. `/saml/metadata` is this service provider's metadata. `GET /live-status` does not need an account id. It is JSON: `signedIn` (true when any local account session exists), `subject`, the receiver state, and the Shared Signals events this process has accepted (`type` and `jti` only). No tokens. If the assertion SessionIndex is not the CAEP session id, the event handler ends this demo's one session and says so. `session-revoked` leaves `signedIn` false. A loopback `entityId` and assertion consumer URL follow `PORT`. Any other host stays as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path; the default `http://localhost:3000` is not treated as an explicit public URL. The live script never binds port 3000 or 8081.
+`PORT` defaults to 3000. `GET /healthz` returns `200` and the body `ok` even when the identity provider metadata is not on disk yet. The home page offers sign-in. `/login` answers a signed AuthnRequest (redirect, or a POST form). `/saml/acs` is the assertion consumer. `/saml/metadata` is this service provider's metadata. Once signed in, the page links `/attribute-protected` and `/orders/42`. Those pages are 401 without a sign-in and otherwise the PEP's `httpStatus()` (200 only for a Permit, 403 on a Deny or any failure). `GET /live-status` does not need an account id. It is JSON: `signedIn` (true when any local account session exists), `subject`, the receiver state, and the Shared Signals events this process has accepted (`type` and `jti` only). A `pep` section adds `pep`, the PEP's status. `GET /pep-status` is that status as JSON and needs a sign-in. No tokens. If the assertion SessionIndex is not the CAEP session id, the event handler ends this demo's one session and says so. `session-revoked` leaves `signedIn` false. A loopback `entityId` and assertion consumer URL follow `PORT`. Any other host stays as written. `PUBLIC_URL` or `--public-url` replaces the origin and keeps the path; the default `http://localhost:3000` is not treated as an explicit public URL. The live script never binds port 3000 or 8081.
 
 `demo/saml.json` points at `file:` paths under `demo/generated/` and does not contain a key. Generate the key pair and, against a running iya-sts, register the application with:
 

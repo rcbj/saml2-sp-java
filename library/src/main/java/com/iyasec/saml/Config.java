@@ -2,12 +2,18 @@
 // SPDX-License-Identifier: MIT
 package com.iyasec.saml;
 
+import com.iyasec.saml.pep.SamlPep;
+import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyFactory;
 import java.security.PrivateKey;
+import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPrivateKey;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
@@ -40,11 +46,18 @@ public final class Config {
         public final String nameIdFormat;
         /** Null when the receiver stays on. {@code false} when it is off. */
         public final Boolean signals;
+        /** The {@code pep} section with this library's defaults filled in, or null when there is none. */
+        public final Map<String, Object> pep;
+        /** The receiver's own TLS client certificate (PEM), or null to use the SP certificate. */
+        public final String ssfClientCertificate;
+        /** The receiver's own TLS client key (PEM), or null to use the SP key. */
+        public final String ssfClientKey;
 
         Resolved(String entityId, String acsUrl, PrivateKey privateKey, String privateKeyPem, X509Certificate certificate,
                  String certificatePem, String idpMetadata, String requestBinding, String responseBinding, int clockSkewMs,
                  boolean wantAssertionsSigned, boolean wantAssertionsEncrypted, boolean allowUnsolicited, String idpCa,
-                 String idpEntityId, String nameIdFormat, Boolean signals) {
+                 String idpEntityId, String nameIdFormat, Boolean signals, Map<String, Object> pep,
+                 String ssfClientCertificate, String ssfClientKey) {
             this.entityId = entityId;
             this.acsUrl = acsUrl;
             this.privateKey = privateKey;
@@ -62,6 +75,9 @@ public final class Config {
             this.idpEntityId = idpEntityId;
             this.nameIdFormat = nameIdFormat;
             this.signals = signals;
+            this.pep = pep;
+            this.ssfClientCertificate = ssfClientCertificate;
+            this.ssfClientKey = ssfClientKey;
         }
 
         public boolean contains(String key) {
@@ -115,12 +131,15 @@ public final class Config {
         String idpCa = config.get("idpCa") instanceof String ca && !ca.isBlank() ? material(ca, base, "idpCa") : null;
         String idpEntityId = config.get("idpEntityId") instanceof String id && !id.isBlank() ? id : null;
         String nameIdFormat = config.get("nameIdFormat") instanceof String format && !format.isBlank() ? format : null;
+        String[] ssfClient = ssfClient(config.get("ssf"), base);
+        Map<String, Object> pep = SamlPep.section(config, base, idpCa == null ? "" : idpCa);
         return new Resolved(
             entityId, acsUrl, privateKey, Keys.privateKeyPem(privateKey), certificate, Keys.certificatePem(certificate),
             idpMetadata, oneOf(config.get("requestBinding"), REQUEST, "redirect", "requestBinding"),
             oneOf(config.get("responseBinding"), RESPONSE, "post", "responseBinding"), skew.intValue() * 1000,
             flag(config, "wantAssertionsSigned", true), flag(config, "wantAssertionsEncrypted", false),
-            flag(config, "allowUnsolicited", false), idpCa, idpEntityId, nameIdFormat, signals
+            flag(config, "allowUnsolicited", false), idpCa, idpEntityId, nameIdFormat, signals, pep,
+            ssfClient == null ? null : ssfClient[0], ssfClient == null ? null : ssfClient[1]
         );
     }
 
@@ -143,7 +162,8 @@ public final class Config {
         return resolveConfig(merged, Path.of(path).toAbsolutePath().getParent().toString());
     }
 
-    static String expand(String value) {
+    /** An {@code env:} or {@code file:} placeholder, followed at most four times. */
+    public static String expand(String value) {
         int seen = 0;
         while (value.startsWith("env:") || value.startsWith("file:")) {
             seen += 1;
@@ -170,6 +190,56 @@ public final class Config {
         } catch (Exception err) {
             Caught.error(err);
             throw new SamlError("config", what + " is neither a PEM nor a readable file (" + resolved + ")", err);
+        }
+    }
+
+    /**
+     * {@code ssf.clientCertificate} and {@code ssf.clientKey}: both or neither.
+     * PEM text, a path relative to the configuration, or a placeholder. The pair
+     * must parse as a certificate and a PKCS#8 key (RSA or EC). A key that is
+     * not the certificate's is refused by the TLS handshake, not here.
+     */
+    private static String[] ssfClient(Object ssf, String base) {
+        if (!(ssf instanceof Map<?, ?> block)) return null;
+        for (String name : new String[] {"clientCertificate", "clientKey"}) {
+            if (block.containsKey(name) && block.get(name) != null && !(block.get(name) instanceof String)) {
+                throw new SamlError("config", "ssf." + name + " must be a PEM, a file path or a placeholder");
+            }
+        }
+        String cert = text(block, "clientCertificate");
+        String key = text(block, "clientKey");
+        if (cert == null && key == null) return null;
+        if (cert == null || key == null) {
+            throw new SamlError("config", "ssf.clientCertificate and ssf.clientKey go together: give both, or neither to use the SP key pair");
+        }
+        String certPem = material(cert, base, "ssf.clientCertificate");
+        String keyPem = material(key, base, "ssf.clientKey");
+        requireTlsClientIdentity(certPem, keyPem);
+        return new String[] {certPem, keyPem};
+    }
+
+    private static String text(Map<?, ?> block, String name) {
+        Object value = block.get(name);
+        if (!(value instanceof String text) || text.isBlank()) return null;
+        return text.strip();
+    }
+
+    private static void requireTlsClientIdentity(String certPem, String keyPem) {
+        try {
+            var certificates = CertificateFactory.getInstance("X.509").generateCertificates(new ByteArrayInputStream(certPem.getBytes(StandardCharsets.UTF_8)));
+            if (certificates.isEmpty()) throw new IllegalArgumentException("no certificate");
+            String body = keyPem.replaceAll("-----BEGIN [^-]+-----", "").replaceAll("-----END [^-]+-----", "").replaceAll("\\s", "");
+            byte[] der = Base64.getDecoder().decode(body);
+            PKCS8EncodedKeySpec spec = new PKCS8EncodedKeySpec(der);
+            try {
+                KeyFactory.getInstance("EC").generatePrivate(spec);
+            } catch (Exception ignored) {
+                KeyFactory.getInstance("RSA").generatePrivate(spec);
+            }
+        } catch (SamlError err) {
+            throw err;
+        } catch (Exception err) {
+            throw new SamlError("config", "ssf.clientCertificate and ssf.clientKey are not a usable TLS client identity: " + err.getMessage(), err);
         }
     }
 

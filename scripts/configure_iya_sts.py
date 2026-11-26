@@ -9,6 +9,15 @@ package is installed, and otherwise asks the Java CLI for metadata.
 It writes iya-sts's listener CA trust chain (leaf, TLS Issuing CA, Intermediate, Root) to the file
 idpCa names, every run (scripts/trust_chain.py). The demo image build copies that file in, so
 rebuild the image after running this against a different iya-sts.
+
+--pep [local|central] (local when left out) also sets the demo up with its embedded PEP (docs/remote-pep.md, steps 2 to 6):
+the PEP's service account in remote-peps; a P-256 key made here with openssl in generated/pep-key.pem
+beside the configuration (0600, never printed, kept out of the image by .dockerignore), certified from
+its own request with the PEP bound to the demo's application; the catalogue row the demo's policy reads;
+and the demo application's OWN policy, which it then enforces, so the realm root is never touched. It
+writes the `pep` section into the configuration. Run again against the same iya-sts, it keeps the
+account, the key and the policy (an administrator's edits survive), binds the PEP again and switches
+the mode.
 """
 
 from __future__ import annotations
@@ -17,6 +26,7 @@ import base64
 import json
 import os
 import re
+import secrets
 import ssl
 import subprocess
 import sys
@@ -37,10 +47,61 @@ ENCRYPTION = {
 }
 MULTIPLE_ACCOUNTS = {"key": "authn.multipleAccounts", "value": True}
 
+# The embedded PEP (--pep). PEP_KEY is relative to the configuration's directory.
+SSF_CLIENT_KEY = "generated/ssf-client.key"
+SSF_CLIENT_CERT = "generated/ssf-client.crt"
+SSF_CLIENT_LABEL = "saml2-sp demo SSF"
+RETIRED_SP_CERTS = "generated/retired-sp-certificates.txt"
+PEP_MODES = ("central", "local")
+PEP_NAME = "pep-saml-demo"
+PEP_KEY = "generated/pep-key.pem"
+PEP_GROUP = "remote-peps"
+PEP_EVENT = "urn:iya:sts:secevent:event-type:pep-policies-changed"
+ACR_ATTRIBUTE = "urn:example:acr"
+TEST_ATTRIBUTE = "attr1"
+TEST_ATTRIBUTE_VALUE = "abc123"
+TEST_ATTRIBUTE_ID = "urn:sts:xacml:attribute:" + TEST_ATTRIBUTE
+ATTRIBUTE_PROTECTED = "attribute-protected"
+OWN_POLICY_IDS = ("urn:saml-sp-demo:samlspdemo:orders",)
+
+
+def orders_policy(namespace: str = "samlspdemo", read_effect: str = "permit") -> str:
+    """The demo application's own policy, in ALFA."""
+    needs_acr = "                condition integerGreaterThan(stringBagSize(acr), 0)\n" if read_effect == "permit" else ""
+    return (
+        f"namespace {namespace} {{\n"
+        '    attribute action { category = actionCat id = "urn:oasis:names:tc:xacml:1.0:action:action-id" type = string }\n'
+        '    attribute kind { category = resourceCat id = "urn:sts:xacml:authzen:resource-type" type = string }\n'
+        f'    attribute acr {{ category = subjectCat id = "{ACR_ATTRIBUTE}" type = string }}\n'
+        f'    attribute {TEST_ATTRIBUTE} {{ category = subjectCat id = "{TEST_ATTRIBUTE_ID}" type = string }}\n'
+        f"    policy {namespace}Orders {{\n"
+        f'        id = "urn:saml-sp-demo:{namespace}:orders"\n'
+        "        apply firstApplicable\n"
+        "        rule readAnOrder {\n"
+        f"            {read_effect}\n"
+        '            target clause action == "read"\n'
+        '            target clause kind == "order"\n'
+        f"{needs_acr}"
+        "        }\n"
+        "        rule readAttributeProtected {\n"
+        "            permit\n"
+        '            target clause action == "read"\n'
+        f'            target clause kind == "{ATTRIBUTE_PROTECTED}"\n'
+        f'            target clause {TEST_ATTRIBUTE} == "{TEST_ATTRIBUTE_VALUE}"\n'
+        "        }\n"
+        "        rule nothingElse {\n"
+        "            deny\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+
 
 def usage() -> str:
     return """Usage: python scripts/configure_iya_sts.py [--config path] [--idp url] [--public-url url]
-                                        [--test-user name | --no-test-user] [--dry-run]
+                                        [--test-user name | --no-test-user]
+                                        [--pep [local|central]] [--pep-name name]
+                                        [--dry-run]
 
   --config        The demo's SAML configuration (default: demo/saml.json)
   --idp           iya-sts's base URL; the realm's, e.g. https://host/realm/acme, for a trust realm
@@ -49,9 +110,25 @@ def usage() -> str:
                   and keep their paths (default: unset; $PUBLIC_URL). Without it, a loopback entityID
                   and ACS follow the running demo's PORT, then $PORT. A non-loopback URL is left as written.
   --test-user     The test user to create (default: saml-demo-user). Its password is
-                  $SAML_DEMO_USER_PASSWORD, or one is generated and printed once. With
-                  $SAML_DEMO_USER_PASSWORD set, an existing user's password is replaced.
+                  $SAML_DEMO_USER_PASSWORD, or one is generated and written to a file beside the
+                  key pair (mode 0600); only the path is printed. With $SAML_DEMO_USER_PASSWORD set,
+                  an existing user's password is replaced.
   --no-test-user  Do not create a test user.
+  --pep [MODE]    Also set up the demo's embedded PEP in this mode, local (the default: it caches
+                  the application's policies and decides in process) or central: its service
+                  account, a key of its own in generated/pep-key.pem (0600), its certificate and
+                  binding, the catalogue row, the demo application's own policy (enforced), and the
+                  `pep` section in the configuration. Safe to run again; the mode is switched.
+  --pep-name      The PEP's service account (default: pep-saml-demo).
+
+With an ssf block (signals on), the Shared Signals receiver authenticates to iya-sts's /ssf/*
+with a TLS client certificate the realm issues the application (issue-tls-client-certificate,
+urn:sts:application:<entityID>): generated/ssf-client.key (0600, never printed) and
+generated/ssf-client.crt, named in the configuration's ssf.clientKey / ssf.clientCertificate.
+A certificate the realm still lists for the application is kept on later runs. The SP's own
+certificate is no longer added to iya-sts's client-certificate truststore; an anchor an
+earlier run added (and the copy stored on the application) is removed once the new
+certificate is in place.
   --dry-run       Print what would be done, and send nothing.
 
 The management API secret is ADMIN_API_CLIENT_SECRET or STS_ADMIN_API_CLIENT_SECRET."""
@@ -133,6 +210,8 @@ def parse_args(argv: list[str], env: dict | None = None) -> Args:
         public_url=str(env.get("PUBLIC_URL") or "http://localhost:3000").rstrip("/"),
         public_url_given=bool(env.get("PUBLIC_URL")),
         test_user="saml-demo-user",
+        pep="",
+        pep_name=PEP_NAME,
         dry_run=False,
         help=False,
     )
@@ -160,6 +239,17 @@ def parse_args(argv: list[str], env: dict | None = None) -> Args:
             out.test_user = value().strip()
         elif arg == "--no-test-user":
             out.test_user = ""
+        elif arg == "--pep":
+            if index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                out.pep = value().strip()
+            else:
+                out.pep = "local"
+            if out.pep not in PEP_MODES:
+                raise SystemExit(f"--pep must be central or local, not {out.pep}")
+        elif arg == "--pep-name":
+            out.pep_name = value().strip()
+            if not out.pep_name:
+                raise SystemExit("--pep-name is empty")
         elif arg == "--dry-run":
             out.dry_run = True
         else:
@@ -298,22 +388,71 @@ def plan_for(files: DemoFiles, base: str, test_user: str, sp_metadata_xml: str) 
         calls.insert(2, {"method": "POST", "path": f"{base}/admin-api/applications/set", "why": f"encrypt the assertion: {attribute}",
                          "body": {"application": files.entity_id, "attribute": attribute, "value": value}})
     if files.ssf_transmitter:
-        calls[-1:-1] = ssf_calls(files, base, "<the SP certificate>")
+        calls[-1:-1] = ssf_calls(files, base) + ssf_client_plan(files, base)
     if test_user:
         calls.append({"method": "POST", "path": f"{base}/admin-api/users/create", "why": f"create the test user {test_user}", "body": {"username": test_user}})
+        calls.append({"method": "POST", "path": f"{base}/admin-api/policies/define-person-attribute",
+                      "why": f"define the realm's custom attribute {TEST_ATTRIBUTE} (unless it is), with an admin:security token",
+                      "body": define_attribute_body()})
+        calls.append({"method": "POST", "path": f"{base}/admin-api/users/set-attribute",
+                      "why": f"give {test_user} {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE}",
+                      "body": {"user": test_user, "attribute": TEST_ATTRIBUTE, "value": TEST_ATTRIBUTE_VALUE}})
     return calls
 
 
-def ssf_calls(files: DemoFiles, base: str, certificate_pem: str) -> list[dict]:
+def define_attribute_body() -> dict:
+    return {"name": TEST_ATTRIBUTE, "label": "Attribute 1", "syntax": "string", "multiValued": False,
+            "description": "The demo's attribute-protected resource is permitted when this is abc123."}
+
+
+def set_test_attribute(call, user: str) -> bool:
+    """The realm's custom attribute attr1, and the test user's value of it.
+    `call(path, body, security)` answers {"status", "body"} and does not stop on a refusal."""
+    defined = call("/policies/define-person-attribute", define_attribute_body(), True)
+    body = defined["body"] if isinstance(defined["body"], dict) else {}
+    words = (" ".join(_errors_of(body)) + " " + str(body.get("error_description") or body.get("error") or "")).lower()
+    not_allowed = defined["status"] in (401, 403) or "security administrator" in words or "insufficient_scope" in words
+    if not not_allowed and not (defined["status"] == 200 and body.get("ok") is not False):
+        if "already" not in words and "exists" not in words:
+            raise SystemExit(f"defining the custom attribute {TEST_ATTRIBUTE}: refused ({defined['status']}): {json.dumps(body)[:400]}")
+    answered = call("/users/set-attribute", {"user": user, "attribute": TEST_ATTRIBUTE, "value": TEST_ATTRIBUTE_VALUE}, False)
+    reply = answered["body"] if isinstance(answered["body"], dict) else {}
+    if answered["status"] == 200 and reply.get("ok") is not False:
+        print(f"{user} has {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE} (a custom attribute of the realm).")
+        return True
+    if not_allowed:
+        print(f"The custom attribute {TEST_ATTRIBUTE} is not defined, and this credential cannot define it:")
+        print("sts-api-client no longer holds SECURITY_ADMIN here (iya-sts seeds it there; an operator took it")
+        print("out). Put it back on Roles, or sign in to the console as a Security Administrator")
+        print("(the bootstrap administrator is), open Directory > Policies > Attribute policy > Custom")
+        print(f"attributes, and add {TEST_ATTRIBUTE} (label \"Attribute 1\", syntax string, one value). Then run")
+        print(f"this script again to give {user} {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE}.")
+    else:
+        print(f"{user} does not have {TEST_ATTRIBUTE} yet: {' '.join(_errors_of(reply))[:300]}")
+    return False
+
+
+def ssf_calls(files: DemoFiles, base: str) -> list[dict]:
+    """The scope the application declares and SSF_MANAGE. Its TLS client certificate is the realm's."""
     return [
         {"method": "POST", "path": f"{base}/admin-api/applications/add", "why": "declare the Shared Signals write scope",
          "body": {"application": files.entity_id, "attribute": "oauthAllowedScope", "value": "ssf.manage"}},
         {"method": "POST", "path": f"{base}/admin-api/roles/add-member", "why": "hold SSF_MANAGE, which authorizes it",
          "body": {"role": "SSF_MANAGE", "kind": "application", "member": files.entity_id}},
-        {"method": "POST", "path": f"{base}/admin-api/tls/trust/add", "why": "trust the SP certificate at the TLS handshake",
-         "body": {"certificates": certificate_pem}},
-        {"method": "POST", "path": f"{base}/admin-api/applications/add-certificate", "why": "store the SP certificate on the application",
-         "body": {"application": files.entity_id, "certificate": certificate_pem}},
+    ]
+
+
+def ssf_client_plan(files: DemoFiles, base: str) -> list[dict]:
+    return [
+        {"method": "GET", "path": f"{base}/admin-api/applications?application={urllib.parse.quote(files.entity_id, safe='')}",
+         "why": f"keep {SSF_CLIENT_CERT} when the realm still lists it for the application", "body": None},
+        {"method": "POST", "path": f"{base}/admin-api/applications/issue-tls-client-certificate",
+         "why": f"(otherwise) the realm issues the receiver its TLS client certificate: {SSF_CLIENT_KEY} (0600), {SSF_CLIENT_CERT}",
+         "body": {"application": files.entity_id, "password": "<one-time>", "keyAlg": "ec-p256", "label": SSF_CLIENT_LABEL}},
+        {"method": "POST", "path": f"{base}/admin-api/tls/trust/remove",
+         "why": "take off the SP certificate's trust anchor an earlier run added (if held)", "body": {"fingerprint": "<the SP certificate's SHA-256>"}},
+        {"method": "POST", "path": f"{base}/admin-api/applications/remove-certificate",
+         "why": "and its copy stored on the application (if stored)", "body": {"application": files.entity_id, "sha256": "<the SP certificate's SHA-256>"}},
     ]
 
 
@@ -357,7 +496,7 @@ def _request(url: str, method: str, headers: dict, body: bytes | None, ca: str |
         return err.code, err.read()
 
 
-def _json(url: str, ca: str | None, method: str = "GET", headers: dict | None = None, body: str | None = None) -> dict:
+def _json(url: str, ca: str | None, method: str = "GET", headers: dict | None = None, body: str | None = None, refuse_denied: bool = True) -> dict:
     raw_headers = dict(headers or {})
     payload = None if body is None else body.encode()
     status, data = _request(url, method, raw_headers, payload, ca)
@@ -366,7 +505,7 @@ def _json(url: str, ca: str | None, method: str = "GET", headers: dict | None = 
         parsed = json.loads(text) if text else {}
     except json.JSONDecodeError as err:
         raise SystemExit(f"{method} {url} answered {status} with non-JSON: {text[:300]}") from err
-    if status in (401, 403):
+    if refuse_denied and status in (401, 403):
         raise SystemExit(f"{method} {url} answered {status}: {json.dumps(parsed)[:300]}")
     return {"status": status, "body": parsed}
 
@@ -375,8 +514,8 @@ def _errors_of(body: dict) -> list[str]:
     return [str(item) for item in (body.get("errors") or [])]
 
 
-def mint_admin_token(origin: str, base: str, ca: str | None, secret: str) -> str:
-    form = urllib.parse.urlencode({"grant_type": "client_credentials", "scope": "admin:read admin:write", "resource": f"{base}/admin-api"})
+def mint_admin_token(origin: str, base: str, ca: str | None, secret: str, scope: str = "admin:read admin:write") -> str:
+    form = urllib.parse.urlencode({"grant_type": "client_credentials", "scope": scope, "resource": f"{base}/admin-api"})
     basic = base64.b64encode(f"sts-api-client:{secret}".encode()).decode()
     reply = _json(f"{base}/oauth2/token", ca, "POST", {"content-type": "application/x-www-form-urlencoded", "authorization": f"Basic {basic}"}, form)
     token = reply["body"].get("access_token") if isinstance(reply["body"], dict) else None
@@ -422,6 +561,9 @@ def main(argv: list[str] | None = None) -> None:
         for call in plan_for(files, base, args.test_user, xml):
             body = f"\n{json.dumps(call['body'], indent=2)}" if call.get("body") is not None else ""
             print(f"{call['method']} {call['path']}  # {call['why']}{body}")
+        if args.pep:
+            for line in pep_plan(files, base, args.pep_name, args.pep):
+                print(line)
         return
     if not Path(files.key).exists() and not Path(files.cert).exists():
         print("No key pair yet; generating one.")
@@ -453,6 +595,18 @@ def main(argv: list[str] | None = None) -> None:
             "accept": "application/json", "content-type": "application/json", "authorization": f"Bearer {token}",
         }, json.dumps(body))
 
+    security_token: list[str] = []
+
+    def call(path: str, body, security: bool = False) -> dict:
+        bearer = token
+        if security:
+            if not security_token:
+                security_token.append(mint_admin_token(origin, base, ca, secret, "admin:read admin:security"))
+            bearer = security_token[0]
+        return _json(f"{base}/admin-api{path}", ca, "POST", {
+            "accept": "application/json", "content-type": "application/json", "authorization": f"Bearer {bearer}",
+        }, json.dumps(body), refuse_denied=False)
+
     create, upload = plan_for(files, base, args.test_user, sp_metadata_xml)[:2]
     created = api("/applications/create", create["body"])
     if created["body"].get("ok"):
@@ -477,16 +631,22 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"setting authn.multipleAccounts was refused: {json.dumps(multiple['body'])[:300]}")
     print("authn.multipleAccounts is on: one browser may hold several signed-in people.")
     if files.ssf_transmitter:
-        certificate_pem = Path(files.cert).read_text(encoding="utf-8")
-        for call in ssf_calls(files, base, certificate_pem):
-            path = call["path"][len(f"{base}/admin-api"):]
-            reply = api(path, call["body"])
+        for step in ssf_calls(files, base):
+            path = step["path"][len(f"{base}/admin-api"):]
+            reply = api(path, step["body"])
             errors = " ".join(_errors_of(reply["body"]))
             if not reply["body"].get("ok") and not re.search(r"already", errors, re.I):
-                raise SystemExit(f"{call['why']}: refused: {json.dumps(reply['body'])[:400]}")
+                raise SystemExit(f"{step['why']}: refused: {json.dumps(reply['body'])[:400]}")
             if not reply["body"].get("ok"):
-                print(f"  {call['why']}: already so ({errors[:160]})")
-        print(f"Shared Signals: {files.entity_id} holds SSF_MANAGE and authenticates to /ssf/* with its own certificate (mutual TLS).")
+                print(f"  {step['why']}: already so ({errors[:160]})")
+
+        def get_page(path: str) -> dict:
+            return _json(f"{base}/admin-api{path}", ca, "GET", {"accept": "application/json", "authorization": f"Bearer {token}"})
+
+        issue_ssf_client_certificate(api, get_page, files, args.config)
+        retire_sp_trust(call, files, args.config)
+        print(f"Shared Signals: {files.entity_id} holds SSF_MANAGE and authenticates to /ssf/* by mutual TLS with the "
+              "TLS client certificate the realm issued it (ssf.clientCertificate), not the SAML key pair.")
     url = idp_metadata_url(base, files.entity_id)
     status, data = _request(url, "GET", {"accept": "application/samlmetadata+xml"}, None, ca)
     if status != 200:
@@ -534,7 +694,269 @@ def main(argv: list[str] | None = None) -> None:
                 with os.fdopen(descriptor, "w", encoding="utf-8") as out:
                     out.write(made["body"]["password"] + "\n")
                 print(f"Generated a password for {args.test_user}; it is in {saved} (readable by you only).")
+        set_test_attribute(call, args.test_user)
+    if args.pep:
+        def get(path: str) -> dict:
+            return _json(f"{base}/admin-api{path}", ca, "GET", {"accept": "application/json", "authorization": f"Bearer {token}"})
+        setup_pep(api, get, files, args.config, args.pep_name, args.pep)
+        print(f"pep: {args.pep_name}, {args.pep} (GET /orders/42 and GET /{ATTRIBUTE_PROTECTED} need a sign-in; any other method is denied)")
     print("Done. Start the demo with: docker compose up --build (the build copies idpCa's trust chain in)")
+
+
+def _pem_blocks(text: str) -> list[str]:
+    return re.findall(r"-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+?-----END CERTIFICATE-----", text or "")
+
+
+def _same_pem(a: str, b: str) -> bool:
+    return re.sub(r"\s+", "", a or "") == re.sub(r"\s+", "", b or "") and bool(a)
+
+
+def certificate_sha256(pem_text: str) -> str:
+    import hashlib
+    blocks = _pem_blocks(pem_text)
+    if not blocks:
+        return ""
+    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(blocks[0])).hexdigest()
+
+
+def ssf_client_paths(config_path: str) -> dict:
+    raw = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    ssf = raw.get("ssf") if isinstance(raw.get("ssf"), dict) else {}
+    base = Path(config_path).resolve().parent
+    out = {}
+    for name, member, default in (("key", "clientKey", SSF_CLIENT_KEY), ("cert", "clientCertificate", SSF_CLIENT_CERT)):
+        value = ssf.get(member) if isinstance(ssf.get(member), str) and ssf.get(member) else default
+        if "-----BEGIN" in value or value.startswith("env:"):
+            raise SystemExit(f"{config_path}'s ssf.{member} must be a file path for this script to write")
+        path = Path(_expand_path(value))
+        out[name] = str(path if path.is_absolute() else (base / path).resolve())
+        out[name + "_value"] = value
+    return out
+
+
+def held_tls_certificates(get, app: str) -> list[dict]:
+    page = get("/applications?application=" + urllib.parse.quote(app, safe=""))["body"]
+    found = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("serialHex") and value.get("certificatePem"):
+                found.append(value)
+            for inner in value.values():
+                walk(inner)
+        elif isinstance(value, list):
+            for inner in value:
+                walk(inner)
+
+    walk(page)
+    return found
+
+
+def _decrypt_key(encrypted: str, password: str, key_path: str) -> None:
+    descriptor = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.close(descriptor)
+    env = dict(os.environ, SAML_SSF_CLIENT_KEY_PASSWORD=password)
+    done = subprocess.run(["openssl", "pkey", "-passin", "env:SAML_SSF_CLIENT_KEY_PASSWORD", "-out", key_path],
+                          input=encrypted, capture_output=True, text=True, env=env, check=False)
+    if done.returncode != 0:
+        raise SystemExit(f"the issued key could not be opened: {done.stderr.strip()[:200]}")
+    os.chmod(key_path, 0o600)
+
+
+def write_ssf_client_section(config_path: str, paths: dict) -> None:
+    path = Path(config_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    ssf = raw.get("ssf") if isinstance(raw.get("ssf"), dict) else {}
+    ssf["clientCertificate"] = paths["cert_value"]
+    ssf["clientKey"] = paths["key_value"]
+    raw["ssf"] = ssf
+    path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+
+def issue_ssf_client_certificate(api, get, files: DemoFiles, config_path: str, decrypt=_decrypt_key) -> bool:
+    paths = ssf_client_paths(config_path)
+    on_disk = Path(paths["cert"]).read_text(encoding="utf-8") if Path(paths["cert"]).exists() else ""
+    leaf = (_pem_blocks(on_disk) or [""])[0]
+    if leaf and Path(paths["key"]).exists():
+        for held in held_tls_certificates(get, files.entity_id):
+            if str(held.get("state") or "valid") == "valid" and _same_pem(held.get("certificatePem") or "", leaf):
+                write_ssf_client_section(config_path, paths)
+                print(f"The receiver's TLS client certificate (serial {held.get('serialHex')}) is one the realm issued to "
+                      f"{files.entity_id} and still lists; kept.")
+                return False
+    password = secrets.token_urlsafe(24)
+    answered = api("/applications/issue-tls-client-certificate", {
+        "application": files.entity_id, "password": password, "keyAlg": "ec-p256", "label": SSF_CLIENT_LABEL,
+    })
+    body = answered["body"] if isinstance(answered["body"], dict) else {}
+    if not body.get("ok"):
+        shown = {k: v for k, v in body.items() if k != "files"}
+        raise SystemExit(f"issuing {files.entity_id} a TLS client certificate was refused: {json.dumps(shown)[:400]}")
+    encrypted = ((body.get("files") or {}).get("key") or {}).get("text") or ""
+    issued = body.get("certificate") or {}
+    leaf = issued.get("certificatePem") or ""
+    chain = issued.get("chainPem") or []
+    if not encrypted or not leaf:
+        raise SystemExit("the issued certificate's answer carried no key or certificate")
+    Path(paths["key"]).parent.mkdir(parents=True, exist_ok=True)
+    decrypt(encrypted, password, paths["key"])
+    pems = [leaf] + [pem for pem in (chain if isinstance(chain, list) else [chain]) if pem and not _same_pem(pem, leaf)]
+    Path(paths["cert"]).write_text("".join(pem if pem.endswith("\n") else pem + "\n" for pem in pems), encoding="utf-8")
+    write_ssf_client_section(config_path, paths)
+    print(f"Issued {files.entity_id} a TLS client certificate from the realm's CA (serial {issued.get('serialHex')}, "
+          f"{issued.get('implicitName') or 'urn:sts:application:' + files.entity_id}) for Shared Signals mutual TLS;")
+    print(f"  wrote {paths['key']} (0600) and {paths['cert']}, named in ssf.clientKey / ssf.clientCertificate.")
+    return True
+
+
+def retire_sp_trust(call, files: DemoFiles, config_path: str) -> list[str]:
+    retired_file = Path(config_path).resolve().parent / RETIRED_SP_CERTS
+    prints = [line.strip() for line in (retired_file.read_text(encoding="utf-8").splitlines() if retired_file.exists() else []) if line.strip()]
+    current = certificate_sha256(Path(files.cert).read_text(encoding="utf-8")) if Path(files.cert).exists() else ""
+    if current and current not in prints:
+        prints.insert(0, current)
+    removed, keep = [], []
+    for fingerprint in prints:
+        settled = True
+        for path, body, absent in (("/tls/trust/remove", {"fingerprint": fingerprint}, "holds no anchor"),
+                                   ("/applications/remove-certificate", {"application": files.entity_id, "sha256": fingerprint}, "stores no certificate")):
+            answer = call(path, body)
+            reply = answer["body"] if isinstance(answer["body"], dict) else {}
+            if answer["status"] == 200 and reply.get("ok") is not False:
+                removed.append(f"{path}:{fingerprint}")
+                continue
+            if absent in " ".join(_errors_of(reply)).lower():
+                continue
+            settled = False
+            print(f"  {path} for {fingerprint[:16]}…: refused ({answer['status']}): {' '.join(_errors_of(reply))[:200]}")
+        if not settled and fingerprint != current:
+            keep.append(fingerprint)
+    if retired_file.exists() or keep:
+        retired_file.write_text("".join(f"{line}\n" for line in keep), encoding="utf-8")
+    for item in removed:
+        what, fingerprint = item.split(":", 1)
+        print(f"Removed the SP certificate {fingerprint[:16]}… from iya-sts ({'trust anchor' if 'trust' in what else 'stored on the application'}).")
+    return removed
+
+
+def pep_plan(files: DemoFiles, base: str, name: str, mode: str) -> list[str]:
+    app = files.entity_id
+    return [
+        f"GET  {base}/admin-api/users?user={name}  # the PEP's service account: created only if unknown",
+        f"POST {base}/admin-api/users/create  # {name}: a service account owned by admin-write, no credential",
+        f"POST {base}/admin-api/groups/add-member  # {name} in {PEP_GROUP}",
+        f"# make a P-256 key at {PEP_KEY} beside the configuration (0600), unless one is there",
+        f"POST {base}/admin-api/xacml/issue-pep-credential  # its certificate request, bound to {app} (a new key or account)",
+        f"POST {base}/admin-api/xacml/set-pep-application  # or, with both kept, bind {name} to {app} again",
+        f"POST {base}/admin-api/xacml/authzen/set-attribute  # subject.acr -> {ACR_ATTRIBUTE}",
+        f"POST {base}/admin-api/applications/fga-create-policy  # {app}'s own policy, unless it has one",
+        f"POST {base}/admin-api/xacml/import-alfa  # the demo policy into it (when {app} enforces none yet, or this script's own)",
+        f"POST {base}/admin-api/applications/fga-enable  # {app} enforces its own policy (the realm root is untouched)",
+        f"POST {base}/admin-api/applications/add  # {PEP_EVENT} in ssfAllowedEvents, only if {app} restricts them",
+        f"# write \"pep\": {{\"name\": \"{name}\", \"mode\": \"{mode}\", \"assertionKey\": \"{PEP_KEY}\"}} into the configuration",
+    ]
+
+
+def make_pep_key(key_file: Path) -> None:
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    old = os.umask(0o077)
+    try:
+        made = subprocess.run(["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", str(key_file)],
+                              check=False, capture_output=True, text=True)
+    finally:
+        os.umask(old)
+    if made.returncode != 0:
+        raise SystemExit("openssl could not make the PEP's key (is openssl installed?)")
+    os.chmod(key_file, 0o600)
+
+
+def pep_csr(key_file: Path, name: str) -> str:
+    made = subprocess.run(["openssl", "req", "-new", "-key", str(key_file), "-subj", f"/CN={name}"],
+                          check=False, capture_output=True, text=True)
+    if made.returncode != 0 or "BEGIN CERTIFICATE REQUEST" not in made.stdout:
+        raise SystemExit("openssl could not make the PEP's certificate request from its key")
+    return made.stdout
+
+
+def _ok(answer: dict, what: str, allow: str = "") -> bool:
+    body = answer["body"] if isinstance(answer["body"], dict) else {}
+    if answer["status"] == 200 and body.get("ok") is not False:
+        return True
+    words = (" ".join(_errors_of(body)) + " " + str(body.get("why") or "")).lower()
+    if allow and allow in words:
+        return False
+    raise SystemExit(f"{what}: refused ({answer['status']}): {json.dumps(body)[:400]}")
+
+
+def write_pep_section(config_path: str, name: str, mode: str) -> None:
+    path = Path(config_path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    section = raw.get("pep") if isinstance(raw.get("pep"), dict) else {}
+    section.update({"name": name, "mode": mode, "assertionKey": PEP_KEY})
+    raw["pep"] = section
+    path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+
+def own_policy(api, get, app: str) -> dict:
+    page_path = f"/applications?application={urllib.parse.quote(app, safe='')}"
+    page = get(page_path)["body"].get("page") or {}
+    fga = page.get("fga") or {}
+    current_id = (fga.get("policy") or {}).get("policyId") or ""
+    if fga.get("enforced") is True and current_id not in OWN_POLICY_IDS:
+        print(f"{app} already enforces a policy of its own ({current_id or 'unnamed'}); it is left as it is.")
+    elif fga.get("enforced") is True:
+        policy = (fga.get("policy") or {}).get("name") or fga.get("reference")
+        _ok(api("/xacml/import-alfa", {"name": policy, "alfa": orders_policy()}), f"writing {policy}")
+        print(f"{app} enforces this script's policy {policy}; it now holds the current version.")
+    else:
+        _ok(api("/applications/fga-create-policy", {"application": app}), f"{app}'s own policy", allow="already")
+        page = get(page_path)["body"].get("page") or {}
+        fga = page.get("fga") or {}
+        policy = (fga.get("policy") or {}).get("name") or fga.get("reference")
+        if not policy:
+            raise SystemExit(f"{app}'s page names no policy of its own: {json.dumps(fga)[:300]}")
+        _ok(api("/xacml/import-alfa", {"name": policy, "alfa": orders_policy()}), f"writing {policy}")
+        _ok(api("/applications/fga-enable", {"application": app}), f"enforcing {app}'s own policy")
+        print(f"{app} now enforces its own policy {policy}: read on an order needs an AuthnContextClassRef; "
+              f"read on {ATTRIBUTE_PROTECTED} needs {TEST_ATTRIBUTE}={TEST_ATTRIBUTE_VALUE}; anything else is denied.")
+    return page
+
+
+def setup_pep(api, get, files: DemoFiles, config_path: str, name: str, mode: str) -> None:
+    app = files.entity_id
+    made_account = get(f"/users?user={urllib.parse.quote(name)}")["body"].get("known") is not True
+    if made_account:
+        _ok(api("/users/create", {"username": name, "invent": False, "credential": "none", "serviceAccount": True,
+                                  "owners": ["admin-write"], "attributes": {"cn": name, "displayName": name}}),
+            f"creating the service account {name}")
+        print(f"Created the PEP's service account {name}.")
+    else:
+        print(f"The PEP's service account {name} already exists.")
+    _ok(api("/groups/add-member", {"group": PEP_GROUP, "member": name}), f"adding {name} to {PEP_GROUP}")
+    key_file = Path(config_path).resolve().parent / PEP_KEY
+    made_key = not key_file.exists()
+    if made_key:
+        make_pep_key(key_file)
+        print(f"Generated the PEP's P-256 key in {key_file} (readable by you only).")
+    if made_key or made_account:
+        _ok(api("/xacml/issue-pep-credential", {"name": name, "csr": pep_csr(key_file, name), "application": app}),
+            "certifying the PEP's key")
+        print(f"Certified the PEP's key and bound {name} to {app}.")
+    else:
+        _ok(api("/xacml/set-pep-application", {"name": name, "application": app}), f"binding {name} to {app}")
+        print(f"Kept the PEP's key; {name} is bound to {app}.")
+    _ok(api("/xacml/authzen/set-attribute", {"object": "subject", "property": "acr", "attributeId": ACR_ATTRIBUTE}),
+        "the catalogue row subject.acr")
+    page = own_policy(api, get, app)
+    allowed = (page.get("attributes") or {}).get("ssfAllowedEvents") or []
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    if allowed and PEP_EVENT not in allowed:
+        _ok(api("/applications/add", {"application": app, "attribute": "ssfAllowedEvents", "value": PEP_EVENT}),
+            "letting pep-policies-changed through ssfAllowedEvents", allow="already")
+        print(f"Added {PEP_EVENT} to {app}'s ssfAllowedEvents.")
+    write_pep_section(config_path, name, mode)
+    print(f"Wrote a {mode} pep section into {config_path}.")
 
 
 def _generate_keys(config_path: str) -> None:
